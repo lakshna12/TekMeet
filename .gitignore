@@ -1,0 +1,45 @@
+# Python bytecode & cache
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+backend/.venv/
+venv/
+
+# Environment configuration & secrets (SECURITY CRITICAL)
+.env
+backend/.env
+.env.local
+.env.*
+!.env.example
+
+# OS & IDE metadata
+.DS_Store
+.vscode/
+.idea/
+
+# Database files & local registries
+backend/app/data/*.db
+backend/app/data/*.json
+*.sqlite3
+
+# Audio recordings & media binaries
+recordings/
+*.wav
+*.mp4
+*.m4a
+
+# Temporary scratch files & build outputs
+scratch/
+dist/
+build/
+node_modules/
+cache/
+
+# .NET build outputs
+media_worker/bin/
+media_worker/obj/
+bin/
+obj/
+media_worker/ffmpeg.exe
+*.exe

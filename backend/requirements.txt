@@ -1,0 +1,22 @@
+# TekMeet Backend Dependencies - Phase 1 Foundation
+msal>=1.31.0,<2.0.0
+pydantic>=2.7.0,<3.0.0
+pydantic-settings>=2.2.0,<3.0.0
+python-dotenv>=1.0.0,<2.0.0
+fastapi>=0.110.0,<1.0.0
+uvicorn[standard]>=0.29.0,<1.0.0
+httpx>=0.27.0,<1.0.0
+python-dateutil>=2.8.0,<3.0.0
+
+# AI & Speech Services - Phase 4
+openai>=1.20.0,<2.0.0
+google-genai>=0.1.0
+
+# Database - SQL Server
+sqlalchemy>=2.0.0,<3.0.0
+alembic>=1.13.0,<2.0.0
+pyodbc>=5.0.0,<6.0.0
+
+# Testing
+pytest>=8.0.0,<10.0.0
+pytest-asyncio>=0.23.0,<2.0.0
