@@ -18,6 +18,7 @@ def mock_settings():
         AZURE_CLIENT_ID="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
         AZURE_CLIENT_SECRET=SecretStr("mock_secret"),
         JOIN_BUFFER_SECONDS=60,  # 60s early join
+        USE_APP_HOSTED_MEDIA=False,
     )
 
 
@@ -223,6 +224,7 @@ async def test_trigger_phase5_pipeline_media_worker_stop(mock_settings, monkeypa
     monkeypatch.setattr("httpx.AsyncClient.get", mock_get)
 
     dispatcher = MeetingDispatcher(pipeline=mock_pipeline, app_settings=mock_settings)
+    monkeypatch.setattr(dispatcher, "check_recording_readiness", AsyncMock(return_value=True))
 
     from app.models.scheduler import ScheduledMeetingJob
     now = datetime.now(timezone.utc)

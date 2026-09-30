@@ -337,14 +337,20 @@ class GraphCallingService:
         if self.settings.use_app_hosted_media:
             media_blob = await self.fetch_media_worker_config_blob()
             if not media_blob:
-                logger.error("[GraphCallingService] FAILED to obtain appHostedMediaConfig blob from Media Worker at %s", self.settings.media_worker_url)
-                record.state = CallState.FAILED
-                record.error_code = "media_worker_unavailable"
-                record.error_message = f"Media worker at {self.settings.media_worker_url} did not return a valid appHostedMediaConfig blob."
-                return record
-            logger.info("[GraphCallingService] Phase 3 Application-Hosted Media mode enabled with appHostedMediaConfig for event_id=%s", event_id)
+                logger.warning(
+                    "[GraphCallingService] Could not obtain appHostedMediaConfig blob from Media Worker at %s. Falling back to serviceHostedMediaConfig.",
+                    self.settings.media_worker_url,
+                )
+            else:
+                logger.info(
+                    "[GraphCallingService] Phase 3 Application-Hosted Media mode enabled with appHostedMediaConfig for event_id=%s",
+                    event_id,
+                )
         else:
-            logger.info("[GraphCallingService] Service-Hosted Media mode enabled (USE_APP_HOSTED_MEDIA=false / Option 1) for event_id=%s", event_id)
+            logger.info(
+                "[GraphCallingService] Service-Hosted Media mode enabled (USE_APP_HOSTED_MEDIA=false / Phase 2) for event_id=%s",
+                event_id,
+            )
 
         # 3. Build payload based on URL type
         if url_type == "SHORT_MEET":

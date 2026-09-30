@@ -13,10 +13,11 @@ namespace MediaWorker.Services
     public class AudioRecordingService : IDisposable
     {
         private readonly ILogger<AudioRecordingService> _logger;
-        private readonly object _fileLock = new object();
+        private readonly object _syncLock = new object();
 
         private AudioSocket? _audioSocket;
         private VideoSocket? _videoSocket;
+        private string? _currentCallId;
         private FileStream? _recordingFileStream;
         private BinaryWriter? _recordingBinaryWriter;
 
@@ -25,10 +26,21 @@ namespace MediaWorker.Services
         private bool _isRecording;
         private bool _disposed;
 
+        // Detected Audio Parameters
+        private int _detectedSampleRate = 16000;
+        private ushort _detectedChannels = 1;
+        private ushort _detectedBitsPerSample = 16;
+
         // Diagnostic Tracking Fields
         private long _callbackCount;
         private long _totalPcmBytesReceived;
         private long _nonZeroSampleCount;
+        private long _totalSampleCount;
+        private int _peakAmplitude;
+        private double _sumSquaredSamples;
+        private long _silentFrameCount;
+        private string? _firstFrameSamples;
+        private string? _firstFrameBytesHex;
         private DateTime? _recordingStartTime;
         private DateTime? _recordingStopTime;
 
@@ -47,48 +59,88 @@ namespace MediaWorker.Services
         public AudioRecordingService(ILogger<AudioRecordingService> logger)
         {
             _logger = logger;
+            InspectAudioSdkTypes();
+        }
+
+        private void InspectAudioSdkTypes()
+        {
+            try
+            {
+                _logger.LogInformation("=== [SDK Inspection] AudioSocketSettings & AudioFormat ===");
+                var settingsType = typeof(AudioSocketSettings);
+                foreach (var prop in settingsType.GetProperties(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance))
+                {
+                    _logger.LogInformation("[SDK Property] AudioSocketSettings.{Name} ({Type})", prop.Name, prop.PropertyType.Name);
+                }
+
+                foreach (var name in Enum.GetNames(typeof(AudioFormat)))
+                {
+                    var val = Convert.ChangeType(Enum.Parse(typeof(AudioFormat), name), typeof(int));
+                    _logger.LogInformation("[SDK Enum] AudioFormat.{Name} = {Value}", name, val);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error inspecting Audio SDK types");
+            }
         }
 
         public bool IsRecording => _isRecording;
         public string? CurrentFilePath => _currentFilePath;
         public string? CurrentMp4FilePath => _currentMp4FilePath;
+        public string? CurrentCallId => _currentCallId;
         public AudioSocket? AudioSocket => _audioSocket;
         public VideoSocket? VideoSocket => _videoSocket;
+        public int DetectedSampleRate => _detectedSampleRate;
+        public ushort DetectedChannels => _detectedChannels;
 
-        public (AudioSocket audioSocket, VideoSocket videoSocket) CreateSockets()
+        private bool _hasNotifiedBackend;
+
+        public (AudioSocket audioSocket, VideoSocket videoSocket) CreateSockets(bool forceNew = false)
         {
-            if (_audioSocket != null && _videoSocket != null)
-                return (_audioSocket, _videoSocket);
-
-            var sharedCallId = Guid.NewGuid().ToString("N");
-
-            if (_audioSocket == null)
+            lock (_syncLock)
             {
-                var audioSettings = new AudioSocketSettings
+                if (_isRecording && _audioSocket != null && _videoSocket != null)
                 {
-                    CallId = sharedCallId,
-                    StreamDirections = StreamDirection.Recvonly,
-                    SupportedAudioFormat = AudioFormat.Pcm44KStereo,
-                };
-                _audioSocket = new AudioSocket(audioSettings);
-                _audioSocket.AudioMediaReceived += OnAudioMediaReceived;
-                _logger.LogInformation("[Audio] AudioSocket created (CallId={CallId}, Recvonly, Pcm44KStereo Full HD Audio).", sharedCallId);
-            }
+                    _logger.LogInformation("[Sockets] Active recording session running. Returning existing sockets for CallId={CallId}.", _currentCallId);
+                    return (_audioSocket, _videoSocket);
+                }
 
-            if (_videoSocket == null)
-            {
-                var videoSettings = new VideoSocketSettings
+                if (forceNew || _audioSocket == null || _videoSocket == null)
                 {
-                    CallId = sharedCallId,
-                    StreamDirections = StreamDirection.Recvonly,
-                    ReceiveColorFormat = VideoColorFormat.NV12,
-                };
-                _videoSocket = new VideoSocket(videoSettings);
-                _videoSocket.VideoMediaReceived += OnVideoMediaReceived;
-                _logger.LogInformation("[Video] VideoSocket created (CallId={CallId}, Recvonly, NV12).", sharedCallId);
-            }
+                    if (_isRecording)
+                    {
+                        _logger.LogInformation("[Sockets] Active recording session running during CreateSockets(forceNew=true). Returning existing sockets for CallId={CallId}.", _currentCallId);
+                        return (_audioSocket!, _videoSocket!);
+                    }
 
-            return (_audioSocket, _videoSocket);
+                    DisposeSocketsInternal();
+
+                    _currentCallId = Guid.NewGuid().ToString("N");
+
+                    var audioSettings = new AudioSocketSettings
+                    {
+                        CallId = _currentCallId,
+                        StreamDirections = StreamDirection.Recvonly,
+                        SupportedAudioFormat = AudioFormat.Pcm44KStereo, // 44.1kHz Stereo PCM (Native Teams Meeting Audio)
+                    };
+                    _audioSocket = new AudioSocket(audioSettings);
+                    _audioSocket.AudioMediaReceived += OnAudioMediaReceived;
+                    _logger.LogInformation("[Audio] AudioSocket initialized | SocketId={SocketId} | CallId={CallId} | SupportedAudioFormat=Pcm44KStereo (44100Hz Stereo 16-bit PCM)", _audioSocket.SocketId, _currentCallId);
+
+                    var videoSettings = new VideoSocketSettings
+                    {
+                        CallId = _currentCallId,
+                        StreamDirections = StreamDirection.Recvonly,
+                        ReceiveColorFormat = VideoColorFormat.NV12,
+                    };
+                    _videoSocket = new VideoSocket(videoSettings);
+                    _videoSocket.VideoMediaReceived += OnVideoMediaReceived;
+                    _logger.LogInformation("[Video] VideoSocket created (CallId={CallId}, Recvonly, NV12).", _currentCallId);
+                }
+
+                return (_audioSocket!, _videoSocket!);
+            }
         }
 
         public AudioSocket CreateAudioSocket()
@@ -103,14 +155,21 @@ namespace MediaWorker.Services
 
         public string StartRecording(string recordingDirectory, string eventId, string callId)
         {
-            lock (_fileLock)
+            lock (_syncLock)
             {
                 if (_isRecording)
                 {
-                    _logger.LogInformation("[Recording] StartRecording called while already recording. Finalizing previous recording first...");
-                    StopRecording();
+                    _logger.LogInformation("[Duplicate Start Ignored] eventId={EventId}/callId={CallId}. Active recording session is already running at {Path}", eventId, callId, _currentFilePath);
+                    return _currentFilePath ?? string.Empty;
                 }
 
+                if (_audioSocket == null || _videoSocket == null)
+                {
+                    CreateSockets(forceNew: false);
+                }
+
+                _currentEventId = eventId;
+                _hasNotifiedBackend = false;
                 var safeEventId = System.Text.RegularExpressions.Regex.Replace(eventId ?? "event", @"[^a-zA-Z0-9_-]", "_");
                 if (safeEventId.Length > 20) safeEventId = safeEventId.Substring(0, 20);
 
@@ -137,6 +196,12 @@ namespace MediaWorker.Services
                 _callbackCount = 0;
                 _totalPcmBytesReceived = 0;
                 _nonZeroSampleCount = 0;
+                _totalSampleCount = 0;
+                _peakAmplitude = 0;
+                _sumSquaredSamples = 0.0;
+                _silentFrameCount = 0;
+                _firstFrameSamples = null;
+                _firstFrameBytesHex = null;
 
                 _videoCallbackCount = 0;
                 _totalVideoBytesReceived = 0;
@@ -144,6 +209,11 @@ namespace MediaWorker.Services
                 _lastVideoHeight = 0;
                 _lastVideoFrameRate = 0;
                 _lastVideoFormat = "NV12";
+
+                // Default initial settings until first frame arrives
+                _detectedSampleRate = 16000;
+                _detectedChannels = 1;
+                _detectedBitsPerSample = 16;
 
                 _recordingStartTime = DateTime.UtcNow;
 
@@ -153,10 +223,12 @@ namespace MediaWorker.Services
                 _videoFileStream = new FileStream(_currentVideoFilePath, FileMode.Create, FileAccess.Write, FileShare.Read);
                 _videoBinaryWriter = new BinaryWriter(_videoFileStream, Encoding.UTF8);
 
-                WriteWavHeader(_recordingBinaryWriter, sampleRate: 44100, channels: 2, bitsPerSample: 16, pcmDataLength: 0);
+                // Write initial placeholder WAV header
+                WriteWavHeader(_recordingBinaryWriter, sampleRate: _detectedSampleRate, channels: _detectedChannels, bitsPerSample: _detectedBitsPerSample, pcmDataLength: 0);
 
                 _isRecording = true;
-                _logger.LogInformation("[Recording] Started Audio (WAV) + Video (NV12) stream session at {StartTime:u}", _recordingStartTime);
+                _logger.LogInformation("[Recording Start] eventId={EventId}/callId={CallId}/file={File}", _currentEventId, _currentCallId, _currentFilePath);
+                _logger.LogInformation("[Recording] Started Audio (WAV) + Video (NV12) stream session at {StartTime:u} (CallId={CallId})", _recordingStartTime, _currentCallId);
                 _logger.LogInformation("[Recording] Audio Path : {AudioPath}", _currentFilePath);
                 _logger.LogInformation("[Recording] Video Path : {VideoPath}", _currentVideoFilePath);
                 _logger.LogInformation("[Recording] Final MP4   : {Mp4Path}", _currentMp4FilePath);
@@ -166,7 +238,7 @@ namespace MediaWorker.Services
 
         public void StopRecording()
         {
-            lock (_fileLock)
+            lock (_syncLock)
             {
                 if (!_isRecording)
                 {
@@ -174,72 +246,208 @@ namespace MediaWorker.Services
                     return;
                 }
 
-                _recordingStopTime = DateTime.UtcNow;
+                StopRecordingInternal();
+            }
+        }
+
+        private void StopRecordingInternal()
+        {
+            if (!_isRecording) return;
+
+            _recordingStopTime = DateTime.UtcNow;
+            _logger.LogInformation("[Recording Stop] eventId={EventId}/callId={CallId}/file={File}", _currentEventId, _currentCallId, _currentFilePath);
+            try
+            {
+                _logger.LogInformation("[Recording] Finalizing media recording session. StartTime: {Start:u}, StopTime: {Stop:u}", _recordingStartTime, _recordingStopTime);
+
+                // Finalize WAV Header with exact detected sample rate and channel count
+                if (_recordingFileStream != null && _recordingBinaryWriter != null)
+                {
+                    _recordingFileStream.Seek(0, SeekOrigin.Begin);
+                    WriteWavHeader(_recordingBinaryWriter, sampleRate: _detectedSampleRate, channels: _detectedChannels, bitsPerSample: _detectedBitsPerSample, pcmDataLength: (uint)_pcmDataBytesWritten);
+                    _recordingBinaryWriter.Flush();
+                    _recordingFileStream.Flush();
+                    _logger.LogInformation("[Recording] WAV header finalized with SampleRate={SampleRate}Hz, Channels={Channels}, Bits={Bits}, PcmDataBytes={DataLength}",
+                        _detectedSampleRate, _detectedChannels, _detectedBitsPerSample, _pcmDataBytesWritten);
+                }
+
+                if (_videoFileStream != null && _videoBinaryWriter != null)
+                {
+                    _videoBinaryWriter.Flush();
+                    _videoFileStream.Flush();
+                    _logger.LogInformation("[Recording] Raw Video (NV12) finalized: {FilePath}", _currentVideoFilePath);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[Recording] Error finalizing stream headers.");
+            }
+            finally
+            {
+                _recordingBinaryWriter?.Close();
+                _recordingFileStream?.Close();
+                _recordingBinaryWriter?.Dispose();
+                _recordingFileStream?.Dispose();
+
+                _videoBinaryWriter?.Close();
+                _videoFileStream?.Close();
+                _videoBinaryWriter?.Dispose();
+                _videoFileStream?.Dispose();
+
+                _recordingBinaryWriter = null;
+                _recordingFileStream = null;
+                _videoBinaryWriter = null;
+                _videoFileStream = null;
+                _isRecording = false;
+
+                // Run Audio Validation & Diagnostic Summary
+                PerformAudioValidationReport();
+
+                long finalWavSize = 0;
+                if (!string.IsNullOrEmpty(_currentFilePath) && File.Exists(_currentFilePath))
+                {
+                    finalWavSize = new FileInfo(_currentFilePath).Length;
+                }
+                double finalDurationSec = (_recordingStopTime.Value - (_recordingStartTime ?? DateTime.UtcNow)).TotalSeconds;
+                _logger.LogInformation("[Recording Finalized] file={File}/size={Size}/duration={Duration:F2}s", _currentFilePath, finalWavSize, finalDurationSec);
+
+                // Trigger FFmpeg MP4 Muxing
+                if (_videoCallbackCount > 0 && _lastVideoWidth > 0 && _lastVideoHeight > 0 &&
+                    !string.IsNullOrEmpty(_currentFilePath) && !string.IsNullOrEmpty(_currentVideoFilePath) && !string.IsNullOrEmpty(_currentMp4FilePath))
+                {
+                    double durationSec = (_recordingStopTime.Value - (_recordingStartTime ?? DateTime.UtcNow)).TotalSeconds;
+                    double fps = durationSec > 0 ? (_videoCallbackCount / durationSec) : 15.0;
+                    if (fps < 1.0) fps = 15.0;
+
+                    _logger.LogInformation("[Recording] Initiating FFmpeg MP4 creation (Total Video Callbacks: {Count}, Duration: {Duration:F1}s, Calculated FPS: {Fps:F2})...",
+                        _videoCallbackCount, durationSec, fps);
+
+                    ConvertToMp4(_currentFilePath, _currentVideoFilePath, _currentMp4FilePath, _lastVideoWidth, _lastVideoHeight, fps);
+                }
+                else if (_videoCallbackCount == 0)
+                {
+                    _logger.LogWarning("[Recording] No video frames were received during the call. MP4 creation skipped. Only WAV recording generated.");
+                }
+
+                DisposeSocketsInternal();
+                NotifyBackendRecordingStopped(_currentCallId, _currentEventId, Path.GetFileName(_currentFilePath));
+            }
+        }
+
+        private string? _currentEventId;
+
+        private void NotifyBackendRecordingStopped(string? callId, string? eventId, string? fileName)
+        {
+            if (string.IsNullOrEmpty(fileName)) return;
+            lock (_syncLock)
+            {
+                if (_hasNotifiedBackend) return;
+                _hasNotifiedBackend = true;
+            }
+            Task.Run(async () =>
+            {
                 try
                 {
-                    _logger.LogInformation("[Recording] Finalizing media recording session. StartTime: {Start:u}, StopTime: {Stop:u}", _recordingStartTime, _recordingStopTime);
-                    _logger.LogInformation("[Recording] Audio Diagnostics: Callbacks: {Count}, RecvBytes: {RecvBytes}, WritBytes: {WritBytes}, NonZero: {NonZero}",
-                        _callbackCount, _totalPcmBytesReceived, _pcmDataBytesWritten, _nonZeroSampleCount);
-                    _logger.LogInformation("[Recording] Video Diagnostics: Callbacks: {Count}, RecvBytes: {RecvBytes}, LastRes: {W}x{H}, Format: {Fmt}",
-                        _videoCallbackCount, _totalVideoBytesReceived, _lastVideoWidth, _lastVideoHeight, _lastVideoFormat);
-
-                    if (_recordingFileStream != null && _recordingBinaryWriter != null)
+                    string backendUrl = Environment.GetEnvironmentVariable("PUBLIC_BACKEND_URL")
+                        ?? Environment.GetEnvironmentVariable("BACKEND_URL")
+                        ?? "http://localhost:8000";
+                    string endpoint = $"{backendUrl.TrimEnd('/')}/api/v1/calls/recording-stopped";
+                    _logger.LogInformation("[Webhook] Sending recording-stopped callback to endpoint: {Endpoint} (CallId={CallId}, EventId={EventId}, File={FileName})", endpoint, callId, eventId, fileName);
+                    using (var client = new System.Net.Http.HttpClient { Timeout = TimeSpan.FromSeconds(10) })
                     {
-                        _recordingFileStream.Seek(0, SeekOrigin.Begin);
-                        WriteWavHeader(_recordingBinaryWriter, sampleRate: 44100, channels: 2, bitsPerSample: 16, pcmDataLength: (uint)_pcmDataBytesWritten);
-                        _recordingBinaryWriter.Flush();
-                        _recordingFileStream.Flush();
-                        _logger.LogInformation("[Recording] WAV file finalized: {FilePath}", _currentFilePath);
-                    }
-
-                    if (_videoFileStream != null && _videoBinaryWriter != null)
-                    {
-                        _videoBinaryWriter.Flush();
-                        _videoFileStream.Flush();
-                        _logger.LogInformation("[Recording] Raw Video (NV12) finalized: {FilePath}", _currentVideoFilePath);
+                        var payload = new { callId = callId, eventId = eventId, fileName = fileName, filePath = fileName };
+                        var json = Newtonsoft.Json.JsonConvert.SerializeObject(payload);
+                        var content = new System.Net.Http.StringContent(json, Encoding.UTF8, "application/json");
+                        var resp = await client.PostAsync(endpoint, content);
+                        _logger.LogInformation("[Webhook] Notified backend of recording stopped (CallId={CallId}, File={FileName}): {Status}", callId, fileName, resp.StatusCode);
                     }
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "[Recording] Error finalizing stream headers.");
+                    _logger.LogWarning(ex, "[Webhook] Could not notify backend of recording stopped.");
+                }
+            });
+        }
+
+        private void DisposeSocketsInternal()
+        {
+            if (_audioSocket != null)
+            {
+                try
+                {
+                    _audioSocket.AudioMediaReceived -= OnAudioMediaReceived;
+                    _audioSocket.Dispose();
+                    _logger.LogInformation("[Sockets] Disposed AudioSocket (CallId={CallId}).", _currentCallId);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "[Sockets] Exception while disposing AudioSocket.");
                 }
                 finally
                 {
-                    _recordingBinaryWriter?.Close();
-                    _recordingFileStream?.Close();
-                    _recordingBinaryWriter?.Dispose();
-                    _recordingFileStream?.Dispose();
-
-                    _videoBinaryWriter?.Close();
-                    _videoFileStream?.Close();
-                    _videoBinaryWriter?.Dispose();
-                    _videoFileStream?.Dispose();
-
-                    _recordingBinaryWriter = null;
-                    _recordingFileStream = null;
-                    _videoBinaryWriter = null;
-                    _videoFileStream = null;
-                    _isRecording = false;
-
-                    // Trigger FFmpeg MP4 Muxing
-                    if (_videoCallbackCount > 0 && _lastVideoWidth > 0 && _lastVideoHeight > 0 &&
-                        !string.IsNullOrEmpty(_currentFilePath) && !string.IsNullOrEmpty(_currentVideoFilePath) && !string.IsNullOrEmpty(_currentMp4FilePath))
-                    {
-                        double durationSec = (_recordingStopTime.Value - (_recordingStartTime ?? DateTime.UtcNow)).TotalSeconds;
-                        double fps = durationSec > 0 ? (_videoCallbackCount / durationSec) : 15.0;
-                        if (fps < 1.0) fps = 15.0;
-
-                        _logger.LogInformation("[Recording] Initiating FFmpeg MP4 creation (Total Video Callbacks: {Count}, Duration: {Duration:F1}s, Calculated FPS: {Fps:F2})...",
-                            _videoCallbackCount, durationSec, fps);
-
-                        ConvertToMp4(_currentFilePath, _currentVideoFilePath, _currentMp4FilePath, _lastVideoWidth, _lastVideoHeight, fps);
-                    }
-                    else if (_videoCallbackCount == 0)
-                    {
-                        _logger.LogWarning("[Recording] No video frames were received during the call. MP4 creation skipped. Only WAV recording generated.");
-                    }
+                    _audioSocket = null;
                 }
             }
+
+            if (_videoSocket != null)
+            {
+                try
+                {
+                    _videoSocket.VideoMediaReceived -= OnVideoMediaReceived;
+                    _videoSocket.Dispose();
+                    _logger.LogInformation("[Sockets] Disposed VideoSocket (CallId={CallId}).", _currentCallId);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "[Sockets] Exception while disposing VideoSocket.");
+                }
+                finally
+                {
+                    _videoSocket = null;
+                }
+            }
+
+            _currentCallId = null;
+        }
+
+        private void PerformAudioValidationReport()
+        {
+            long wavSize = 0;
+            if (!string.IsNullOrEmpty(_currentFilePath) && File.Exists(_currentFilePath))
+            {
+                wavSize = new FileInfo(_currentFilePath).Length;
+            }
+
+            int bytesPerSample = _detectedBitsPerSample / 8;
+            int bytesPerFrame = _detectedChannels * bytesPerSample;
+            double durationSec = (bytesPerFrame > 0 && _detectedSampleRate > 0)
+                ? (double)_pcmDataBytesWritten / (_detectedSampleRate * bytesPerFrame)
+                : 0.0;
+
+            double rmsAmplitude = _totalSampleCount > 0 ? Math.Sqrt(_sumSquaredSamples / _totalSampleCount) : 0.0;
+            bool isSilent = (_pcmDataBytesWritten == 0) || (_nonZeroSampleCount == 0) || (_peakAmplitude < 50) || (rmsAmplitude < 10.0);
+
+            var sb = new StringBuilder();
+            sb.AppendLine();
+            sb.AppendLine("==================================================");
+            sb.AppendLine("[Audio Recording Summary & Validation]");
+            sb.AppendLine($"  - Audio Socket Initialized : {(_audioSocket != null)}");
+            sb.AppendLine($"  - Audio Frames Received    : {_callbackCount}");
+            sb.AppendLine($"  - Audio Bytes Received     : {_totalPcmBytesReceived}");
+            sb.AppendLine($"  - WAV File Path            : {_currentFilePath}");
+            sb.AppendLine($"  - Sample Rate              : {_detectedSampleRate} Hz");
+            sb.AppendLine($"  - Channel Count            : {_detectedChannels} ({(_detectedChannels == 1 ? "Mono" : "Stereo")})");
+            sb.AppendLine($"  - Bits Per Sample          : {_detectedBitsPerSample}");
+            sb.AppendLine($"  - Final WAV Size           : {wavSize} bytes");
+            sb.AppendLine($"  - Final WAV Duration       : {durationSec:F2} sec");
+            sb.AppendLine($"  - Peak Amplitude           : {_peakAmplitude} / 32767");
+            sb.AppendLine($"  - RMS Amplitude            : {rmsAmplitude:F2}");
+            sb.AppendLine($"  - Non-Zero Samples Count   : {_nonZeroSampleCount} / {_totalSampleCount}");
+            sb.AppendLine($"  - Silent Frames Count       : {_silentFrameCount} / {_callbackCount}");
+            sb.AppendLine($"  - Silent (Is Silent?)       : {isSilent}");
+            sb.AppendLine("==================================================");
+
+            _logger.LogInformation(sb.ToString());
         }
 
         private void ConvertToMp4(string wavPath, string nv12Path, string mp4Path, int width, int height, double fps)
@@ -321,13 +529,13 @@ namespace MediaWorker.Services
         {
             try
             {
-                Interlocked.Increment(ref _callbackCount);
+                long currentCallback = Interlocked.Increment(ref _callbackCount);
 
                 using (var buffer = e.Buffer)
                 {
                     if (buffer == null || buffer.Length == 0)
                     {
-                        _logger.LogDebug("[Audio] AudioMediaReceived fired but buffer is null or empty. Callback #{Count}", _callbackCount);
+                        _logger.LogDebug("[Audio] AudioMediaReceived fired but buffer is null or empty. Callback #{Count}", currentCallback);
                         return;
                     }
 
@@ -336,28 +544,83 @@ namespace MediaWorker.Services
 
                     if (dataPtr == IntPtr.Zero || dataLength <= 0)
                     {
-                        _logger.LogDebug("[Audio] AudioMediaReceived fired but DataPtr is Zero. Callback #{Count}", _callbackCount);
+                        _logger.LogDebug("[Audio] AudioMediaReceived fired but DataPtr is Zero. Callback #{Count}", currentCallback);
                         return;
                     }
 
-                    byte[] pcmBytes = new byte[dataLength];
-                    Marshal.Copy(dataPtr, pcmBytes, 0, dataLength);
+                    // Normalize and resample incoming Skype AudioFormat to 16,000 Hz Mono 16-bit PCM
+                    var incomingFormat = buffer.AudioFormat;
+                    byte[] pcmBytes = ProcessAndResampleAudioFrame(dataPtr, dataLength, incomingFormat);
+
+                    _detectedSampleRate = 16000;
+                    _detectedChannels = 1;
+                    _detectedBitsPerSample = 16;
+
+                    if (buffer.IsSilence)
+                    {
+                        Interlocked.Increment(ref _silentFrameCount);
+                    }
 
                     Interlocked.Add(ref _totalPcmBytesReceived, dataLength);
 
-                    // Inspect frame for non-zero PCM samples
+                    // Analyze 16-bit signed PCM samples on normalized 16kHz Mono output
+                    int sampleCountInFrame = pcmBytes.Length / 2;
                     long frameNonZeroCount = 0;
-                    for (int i = 0; i < pcmBytes.Length; i++)
-                    {
-                        if (pcmBytes[i] != 0)
-                            frameNonZeroCount++;
-                    }
-                    Interlocked.Add(ref _nonZeroSampleCount, frameNonZeroCount);
+                    int framePeak = 0;
+                    double frameSumSquare = 0.0;
 
-                    if (_callbackCount == 1 || _callbackCount % 50 == 0)
+                    short[] samplePreview = new short[Math.Min(8, sampleCountInFrame)];
+
+                    lock (_syncLock)
                     {
-                        _logger.LogInformation("[Audio] AudioMediaReceived fired! Callback #{Count}, Frame Len: {Len} bytes, Frame NonZero Samples: {FrameNonZero}, Total Bytes Recv: {TotalBytes}",
-                            _callbackCount, dataLength, frameNonZeroCount, _totalPcmBytesReceived);
+                        for (int i = 0; i < sampleCountInFrame; i++)
+                        {
+                            short sample = BitConverter.ToInt16(pcmBytes, i * 2);
+                            if (i < samplePreview.Length)
+                            {
+                                samplePreview[i] = sample;
+                            }
+
+                            if (sample != 0)
+                            {
+                                frameNonZeroCount++;
+                            }
+
+                            int absVal = Math.Abs((int)sample);
+                            if (absVal > framePeak) framePeak = absVal;
+                            if (absVal > _peakAmplitude) _peakAmplitude = absVal;
+
+                            frameSumSquare += (double)sample * sample;
+                        }
+
+                        _nonZeroSampleCount += frameNonZeroCount;
+                        _totalSampleCount += sampleCountInFrame;
+                        _sumSquaredSamples += frameSumSquare;
+                    }
+
+                    if (currentCallback == 1)
+                    {
+                        var sbSamples = new StringBuilder("[");
+                        for (int s = 0; s < samplePreview.Length; s++)
+                        {
+                            sbSamples.Append(samplePreview[s]);
+                            if (s < samplePreview.Length - 1) sbSamples.Append(", ");
+                        }
+                        sbSamples.Append("]");
+                        _firstFrameSamples = sbSamples.ToString();
+
+                        int hexLen = Math.Min(16, pcmBytes.Length);
+                        _firstFrameBytesHex = BitConverter.ToString(pcmBytes, 0, hexLen);
+
+                        _logger.LogInformation(
+                            "[Audio Diagnostic] Callback #{Count} | SocketHash={SocketHash} | CallId={CallId} | SupportedFormat={SupportedFmt} | IncomingFormat={IncomingFmt} | SampleRate={SampleRate}Hz | Channels={Channels} | Bits={Bits} | BufferLen={BufferLen}B | IsSilence={IsSilence} | FrameNonZero={FrameNonZero} | FirstSamples={FirstSamples}",
+                            currentCallback, _audioSocket?.GetHashCode() ?? 0, _currentCallId ?? "", AudioFormat.Pcm44KStereo, incomingFormat, _detectedSampleRate, _detectedChannels, _detectedBitsPerSample, dataLength, buffer.IsSilence, frameNonZeroCount, _firstFrameSamples);
+                    }
+                    else if (currentCallback % 50 == 0)
+                    {
+                        _logger.LogInformation(
+                            "[Audio Diagnostic] Callback #{Count} | SocketHash={SocketHash} | CallId={CallId} | SupportedFormat={SupportedFmt} | IncomingFormat={IncomingFmt} | SampleRate={SampleRate}Hz | Channels={Channels} | Bits={Bits} | BufferLen={BufferLen}B | IsSilence={IsSilence} | FrameNonZero={FrameNonZero} | PeakAmp={Peak}",
+                            currentCallback, _audioSocket?.GetHashCode() ?? 0, _currentCallId ?? "", AudioFormat.Pcm44KStereo, incomingFormat, _detectedSampleRate, _detectedChannels, _detectedBitsPerSample, dataLength, buffer.IsSilence, frameNonZeroCount, framePeak);
                     }
 
                     WritePcmFrame(pcmBytes);
@@ -366,6 +629,66 @@ namespace MediaWorker.Services
             catch (Exception ex)
             {
                 _logger.LogError(ex, "[Audio] Error inside AudioMediaReceived callback handling PCM frame.");
+            }
+        }
+
+        private byte[] ProcessAndResampleAudioFrame(IntPtr dataPtr, int dataLength, AudioFormat format)
+        {
+            if (format == AudioFormat.Pcm16K)
+            {
+                byte[] pcmBytes = new byte[dataLength];
+                Marshal.Copy(dataPtr, pcmBytes, 0, dataLength);
+                return pcmBytes;
+            }
+            else if (format == AudioFormat.Pcm44KStereo)
+            {
+                // 44.1kHz Stereo (2 ch * 2 bytes = 4 bytes per sample frame) -> 16kHz Mono (1 ch * 2 bytes = 2 bytes per sample)
+                int numStereoSamples = dataLength / 4;
+                if (numStereoSamples == 0) return Array.Empty<byte>();
+
+                short[] mono44k = new short[numStereoSamples];
+                for (int i = 0; i < numStereoSamples; i++)
+                {
+                    short left = Marshal.ReadInt16(dataPtr, i * 4);
+                    short right = Marshal.ReadInt16(dataPtr, i * 4 + 2);
+                    mono44k[i] = (short)((left + right) / 2);
+                }
+
+                double ratio = 44100.0 / 16000.0;
+                int targetSampleCount = (int)(numStereoSamples / ratio);
+                byte[] outputBytes = new byte[targetSampleCount * 2];
+
+                for (int i = 0; i < targetSampleCount; i++)
+                {
+                    double inPos = i * ratio;
+                    int idx = (int)inPos;
+                    double frac = inPos - idx;
+
+                    short s;
+                    if (idx + 1 < numStereoSamples)
+                    {
+                        s = (short)(mono44k[idx] * (1.0 - frac) + mono44k[idx + 1] * frac);
+                    }
+                    else if (idx < numStereoSamples)
+                    {
+                        s = mono44k[idx];
+                    }
+                    else
+                    {
+                        s = 0;
+                    }
+
+                    outputBytes[i * 2] = (byte)(s & 0xFF);
+                    outputBytes[i * 2 + 1] = (byte)((s >> 8) & 0xFF);
+                }
+
+                return outputBytes;
+            }
+            else
+            {
+                byte[] pcmBytes = new byte[dataLength];
+                Marshal.Copy(dataPtr, pcmBytes, 0, dataLength);
+                return pcmBytes;
             }
         }
 
@@ -424,7 +747,7 @@ namespace MediaWorker.Services
             if (!_isRecording || videoBytes == null || videoBytes.Length == 0)
                 return;
 
-            lock (_fileLock)
+            lock (_syncLock)
             {
                 if (!_isRecording || _videoBinaryWriter == null)
                     return;
@@ -447,7 +770,7 @@ namespace MediaWorker.Services
             if (!_isRecording || pcmBytes == null || pcmBytes.Length == 0)
                 return;
 
-            lock (_fileLock)
+            lock (_syncLock)
             {
                 if (!_isRecording || _recordingBinaryWriter == null)
                     return;
@@ -466,7 +789,7 @@ namespace MediaWorker.Services
             }
         }
 
-        private static void WriteWavHeader(BinaryWriter writer, int sampleRate, ushort channels, ushort bitsPerSample, uint pcmDataLength)
+        public static void WriteWavHeader(BinaryWriter writer, int sampleRate, ushort channels, ushort bitsPerSample, uint pcmDataLength)
         {
             ushort blockAlign = (ushort)(channels * (bitsPerSample / 8));
             uint byteRate = (uint)(sampleRate * blockAlign);
@@ -477,8 +800,8 @@ namespace MediaWorker.Services
             writer.Write(Encoding.ASCII.GetBytes("WAVE"));
 
             writer.Write(Encoding.ASCII.GetBytes("fmt "));
-            writer.Write(16);
-            writer.Write((ushort)1);
+            writer.Write(16); // subchunk1 size (16 for PCM)
+            writer.Write((ushort)1); // audio format (1 = PCM)
             writer.Write(channels);
             writer.Write(sampleRate);
             writer.Write(byteRate);
@@ -491,18 +814,14 @@ namespace MediaWorker.Services
 
         public void Dispose()
         {
-            if (!_disposed)
+            lock (_syncLock)
             {
-                StopRecording();
-
-                if (_audioSocket != null)
+                if (!_disposed)
                 {
-                    _audioSocket.AudioMediaReceived -= OnAudioMediaReceived;
-                    _audioSocket.Dispose();
-                    _audioSocket = null;
+                    StopRecordingInternal();
+                    DisposeSocketsInternal();
+                    _disposed = true;
                 }
-
-                _disposed = true;
             }
         }
     }

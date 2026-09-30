@@ -76,8 +76,7 @@ namespace MediaWorker.Services
 
             try
             {
-                var audioSocket = _audioRecordingService.CreateAudioSocket();
-                var videoSocket = _audioRecordingService.CreateVideoSocket();
+                var (audioSocket, videoSocket) = _audioRecordingService.CreateSockets(forceNew: false);
                 var config = MediaPlatform.CreateMediaConfiguration(audioSocket, videoSocket);
                 if (config == null) return string.Empty;
 

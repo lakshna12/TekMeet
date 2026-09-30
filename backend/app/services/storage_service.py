@@ -89,11 +89,14 @@ class StorageService:
 
     # --- Transcript Persistence ---
 
+    # --- Transcript Persistence ---
+
     def save_transcript(self, transcript: Transcript) -> bool:
         """Save or update a Transcript record in transcript_registry.json and Database."""
         with self._lock:
             data = self._load_json_file(self.transcript_file)
-            data[transcript.event_id] = transcript.model_dump(mode="json")
+            data[transcript.transcript_id] = transcript.model_dump(mode="json")
+            data[f"event_{transcript.event_id}"] = transcript.model_dump(mode="json")
             res = self._atomic_write_json(self.transcript_file, data)
 
         try:
@@ -111,29 +114,60 @@ class StorageService:
 
         return res
 
-    def get_transcript(self, event_id: str) -> Optional[Transcript]:
-        """Retrieve a Transcript record by event ID."""
+    def get_transcript(self, event_id_or_transcript_id: str) -> Optional[Transcript]:
+        """Retrieve a Transcript record by transcript ID or event ID."""
         with self._lock:
             data = self._load_json_file(self.transcript_file)
-            item = data.get(event_id)
+            item = data.get(event_id_or_transcript_id) or data.get(f"event_{event_id_or_transcript_id}")
+            if not item:
+                for k, v in data.items():
+                    if isinstance(v, dict) and (v.get("transcript_id") == event_id_or_transcript_id or v.get("event_id") == event_id_or_transcript_id):
+                        item = v
+                        break
             if not item:
                 return None
             try:
                 return Transcript.model_validate(item)
             except Exception as exc:
-                logger.error("[StorageService] Failed to validate Transcript for event '%s': %s", event_id, exc)
+                logger.error("[StorageService] Failed to validate Transcript for key '%s': %s", event_id_or_transcript_id, exc)
                 return None
+
+    def get_transcript_by_recording(self, recording_file: str, call_id: Optional[str] = None) -> Optional[Transcript]:
+        """Retrieve a Transcript matching a specific recording filename or call ID."""
+        target_name = os.path.basename(recording_file).lower()
+        with self._lock:
+            data = self._load_json_file(self.transcript_file)
+            for item in data.values():
+                if isinstance(item, dict):
+                    rec_file = os.path.basename(item.get("recording_file", "")).lower()
+                    item_call = item.get("call_id")
+                    if rec_file and rec_file == target_name:
+                        try:
+                            return Transcript.model_validate(item)
+                        except Exception:
+                            pass
+                    if call_id and item_call and item_call == call_id:
+                        try:
+                            return Transcript.model_validate(item)
+                        except Exception:
+                            pass
+        return None
 
     def get_all_transcripts(self) -> List[Transcript]:
         """Retrieve all stored Transcript records."""
         with self._lock:
             data = self._load_json_file(self.transcript_file)
             result = []
+            seen_ids = set()
             for k, item in data.items():
-                try:
-                    result.append(Transcript.model_validate(item))
-                except Exception:
-                    pass
+                if isinstance(item, dict):
+                    t_id = item.get("transcript_id")
+                    if t_id and t_id not in seen_ids:
+                        try:
+                            result.append(Transcript.model_validate(item))
+                            seen_ids.add(t_id)
+                        except Exception:
+                            pass
             return result
 
     # --- Meeting Summary Persistence ---
@@ -142,7 +176,8 @@ class StorageService:
         """Save or update a MeetingSummary record in summary_registry.json and Database."""
         with self._lock:
             data = self._load_json_file(self.summary_file)
-            data[summary.event_id] = summary.model_dump(mode="json")
+            data[summary.summary_id] = summary.model_dump(mode="json")
+            data[f"event_{summary.event_id}"] = summary.model_dump(mode="json")
             res = self._atomic_write_json(self.summary_file, data)
 
         try:
@@ -158,29 +193,51 @@ class StorageService:
 
         return res
 
-    def get_summary(self, event_id: str) -> Optional[MeetingSummary]:
-        """Retrieve a MeetingSummary record by event ID."""
+    def get_summary(self, event_id_or_summary_id: str) -> Optional[MeetingSummary]:
+        """Retrieve a MeetingSummary record by summary ID or event ID."""
         with self._lock:
             data = self._load_json_file(self.summary_file)
-            item = data.get(event_id)
+            item = data.get(event_id_or_summary_id) or data.get(f"event_{event_id_or_summary_id}")
+            if not item:
+                for k, v in data.items():
+                    if isinstance(v, dict) and (v.get("summary_id") == event_id_or_summary_id or v.get("event_id") == event_id_or_summary_id):
+                        item = v
+                        break
             if not item:
                 return None
             try:
                 return MeetingSummary.model_validate(item)
             except Exception as exc:
-                logger.error("[StorageService] Failed to validate MeetingSummary for event '%s': %s", event_id, exc)
+                logger.error("[StorageService] Failed to validate MeetingSummary for key '%s': %s", event_id_or_summary_id, exc)
                 return None
+
+    def get_summary_by_transcript_id(self, transcript_id: str) -> Optional[MeetingSummary]:
+        """Retrieve a MeetingSummary record matching a specific transcript_id."""
+        with self._lock:
+            data = self._load_json_file(self.summary_file)
+            for item in data.values():
+                if isinstance(item, dict) and item.get("transcript_id") == transcript_id:
+                    try:
+                        return MeetingSummary.model_validate(item)
+                    except Exception:
+                        pass
+        return None
 
     def get_all_summaries(self) -> List[MeetingSummary]:
         """Retrieve all stored MeetingSummary records."""
         with self._lock:
             data = self._load_json_file(self.summary_file)
             result = []
+            seen_ids = set()
             for k, item in data.items():
-                try:
-                    result.append(MeetingSummary.model_validate(item))
-                except Exception:
-                    pass
+                if isinstance(item, dict):
+                    s_id = item.get("summary_id")
+                    if s_id and s_id not in seen_ids:
+                        try:
+                            result.append(MeetingSummary.model_validate(item))
+                            seen_ids.add(s_id)
+                        except Exception:
+                            pass
             return result
 
     # --- Delivery Record Persistence ---
@@ -189,7 +246,8 @@ class StorageService:
         """Save or update a DeliveryRecord in delivery_registry.json and Database."""
         with self._lock:
             data = self._load_json_file(self.delivery_file)
-            data[record.event_id] = record.model_dump(mode="json")
+            data[record.delivery_id] = record.model_dump(mode="json")
+            data[f"event_{record.event_id}"] = record.model_dump(mode="json")
             res = self._atomic_write_json(self.delivery_file, data)
 
         try:
@@ -206,18 +264,69 @@ class StorageService:
 
         return res
 
-    def get_delivery_record(self, event_id: str) -> Optional[DeliveryRecord]:
-        """Retrieve a DeliveryRecord by event ID."""
+    def get_transcript_by_call_id(self, call_id: str) -> Optional[Transcript]:
+        """Retrieve a Transcript matching a specific call ID."""
+        if not call_id:
+            return None
+        with self._lock:
+            data = self._load_json_file(self.transcript_file)
+            for item in data.values():
+                if isinstance(item, dict) and item.get("call_id") == call_id:
+                    try:
+                        return Transcript.model_validate(item)
+                    except Exception:
+                        pass
+        return None
+
+    def get_delivery_record(self, event_id_or_delivery_id: str) -> Optional[DeliveryRecord]:
+        """Retrieve a DeliveryRecord by delivery ID or event ID."""
         with self._lock:
             data = self._load_json_file(self.delivery_file)
-            item = data.get(event_id)
+            item = data.get(event_id_or_delivery_id) or data.get(f"event_{event_id_or_delivery_id}")
+            if not item:
+                for k, v in data.items():
+                    if isinstance(v, dict) and (v.get("delivery_id") == event_id_or_delivery_id or v.get("event_id") == event_id_or_delivery_id):
+                        item = v
+                        break
             if not item:
                 return None
             try:
                 return DeliveryRecord.model_validate(item)
             except Exception as exc:
-                logger.error("[StorageService] Failed to validate DeliveryRecord for event '%s': %s", event_id, exc)
+                logger.error("[StorageService] Failed to validate DeliveryRecord for key '%s': %s", event_id_or_delivery_id, exc)
                 return None
+
+    def get_delivery_record_by_recording(self, recording_file: str) -> Optional[DeliveryRecord]:
+        """Retrieve a DeliveryRecord matching a specific recording filename."""
+        if not recording_file:
+            return None
+        target_name = os.path.basename(recording_file).lower()
+        with self._lock:
+            data = self._load_json_file(self.delivery_file)
+            for item in data.values():
+                if isinstance(item, dict):
+                    raw_rf = item.get("recording_file") or ""
+                    rec_file = os.path.basename(raw_rf).lower()
+                    if rec_file and rec_file == target_name:
+                        try:
+                            return DeliveryRecord.model_validate(item)
+                        except Exception:
+                            pass
+        return None
+
+    def get_delivery_record_by_call_id(self, call_id: str) -> Optional[DeliveryRecord]:
+        """Retrieve a DeliveryRecord matching a specific call ID."""
+        if not call_id:
+            return None
+        with self._lock:
+            data = self._load_json_file(self.delivery_file)
+            for item in data.values():
+                if isinstance(item, dict) and item.get("call_id") == call_id:
+                    try:
+                        return DeliveryRecord.model_validate(item)
+                    except Exception:
+                        pass
+        return None
 
     def get_all_delivery_records(self) -> List[DeliveryRecord]:
         """Retrieve all stored DeliveryRecord objects."""

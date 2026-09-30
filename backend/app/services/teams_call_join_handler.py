@@ -8,7 +8,7 @@ DefaultMockJoinHandler. When the dispatcher detects a meeting is due,
 it calls handle_join(), which:
 
   1. Validates the join URL is present.
-  2. Delegates to GraphCallingService.join_meeting().
+  2. Delegates to GraphCallingService.join_meeting(). 
   3. Stores the returned Graph call_id on the ScheduledMeetingJob.
   4. Returns True on success, False on any failure.
 """
@@ -16,7 +16,7 @@ it calls handle_join(), which:
 import logging
 from typing import Optional
 
-from app.models.scheduler import ScheduledMeetingJob
+from app.models.scheduler import MeetingStatus, ScheduledMeetingJob
 from app.services.graph_calling_service import GraphCallingService, graph_calling_service
 from app.models.call import CallState
 
@@ -46,6 +46,15 @@ class TeamsCallJoinHandler:
                 job.event_id,
             )
             return False
+
+        if job.call_id or job.status == MeetingStatus.TRIGGERED:
+            logger.info(
+                "[Duplicate Join Ignored] Meeting '%s' (event_id: %s) is already joined/triggered (call_id: %s).",
+                job.subject,
+                job.event_id,
+                job.call_id,
+            )
+            return True
 
         logger.info(
             "[TeamsCallJoinHandler] Initiating join for meeting '%s' (event_id: %s, start: %s)",

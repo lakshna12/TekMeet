@@ -107,6 +107,24 @@ namespace MediaWorker
                     return;
                 }
 
+                if (path == "/api/media/status")
+                {
+                    var payload = new {
+                        status = "healthy",
+                        isRecording = recordingService.IsRecording,
+                        currentCallId = recordingService.CurrentCallId,
+                        currentFilePath = recordingService.CurrentFilePath,
+                        detectedSampleRate = recordingService.DetectedSampleRate,
+                        detectedChannels = recordingService.DetectedChannels,
+                        mediaPlatformInitialized = mediaHost.IsInitialized
+                    };
+                    string json = Newtonsoft.Json.JsonConvert.SerializeObject(payload);
+                    byte[] buf = Encoding.UTF8.GetBytes(json);
+                    resp.OutputStream.Write(buf, 0, buf.Length);
+                    resp.Close();
+                    return;
+                }
+
                 if (path == "/api/media/config")
                 {
                     string blob = mediaHost.GetMediaConfigurationBlob();

@@ -118,12 +118,27 @@ class Settings(BaseSettings):
     deepgram_api_key: Optional[SecretStr] = Field(
         default=None,
         validation_alias="DEEPGRAM_API_KEY",
-        description="Deepgram API Key for Speech-to-Text transcription",
+        description="Deepgram API Key for nova-2 speech-to-text transcription",
     )
     deepgram_model: str = Field(
         default="nova-2",
         validation_alias="DEEPGRAM_MODEL",
-        description="Deepgram STT model identifier",
+        description="Model name for Deepgram transcription API",
+    )
+    claude_api_key: Optional[SecretStr] = Field(
+        default=None,
+        validation_alias="CLAUDE_API_KEY",
+        description="Anthropic Claude API Key for meeting transcript summarization",
+    )
+    anthropic_api_key: Optional[SecretStr] = Field(
+        default=None,
+        validation_alias="ANTHROPIC_API_KEY",
+        description="Alias for Anthropic Claude API Key",
+    )
+    claude_model: str = Field(
+        default="claude-3-5-sonnet-20241022",
+        validation_alias="CLAUDE_MODEL",
+        description="Claude LLM model identifier for summarization",
     )
     openai_api_key: Optional[SecretStr] = Field(
         default=None,
@@ -135,28 +150,13 @@ class Settings(BaseSettings):
         validation_alias="WHISPER_MODEL",
         description="Model name for OpenAI Whisper transcription API",
     )
-    claude_api_key: Optional[SecretStr] = Field(
-        default=None,
-        validation_alias="CLAUDE_API_KEY",
-        description="Anthropic Claude API Key for meeting transcript summarization",
-    )
-    claude_model: str = Field(
-        default="claude-3-5-sonnet-20241022",
-        validation_alias="CLAUDE_MODEL",
-        description="Anthropic Claude LLM model identifier for summarization",
-    )
-    anthropic_api_key: Optional[SecretStr] = Field(
-        default=None,
-        validation_alias="ANTHROPIC_API_KEY",
-        description="Alternative alias for Anthropic Claude API Key",
-    )
     gemini_api_key: Optional[SecretStr] = Field(
         default=None,
         validation_alias="GEMINI_API_KEY",
         description="Google Gemini API Key for meeting transcript summarization",
     )
     gemini_model: str = Field(
-        default="gemini-1.5-flash",
+        default="gemini-3.5-flash",
         validation_alias="GEMINI_MODEL",
         description="Google Gemini LLM model identifier for summarization",
     )

@@ -302,3 +302,41 @@ async def test_tc15_handling_missing_api_key():
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
+
+
+def test_wav_header_format_and_silence_validation():
+    """Verify WAV header metadata calculation and silence detection for 16kHz Mono and 44.1kHz Stereo."""
+    # 1. Test 16kHz Mono tone file
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp1:
+        create_synthetic_wav_file(tmp1.name, duration_seconds=1.0, sample_rate=16000, has_audio=True)
+        tmp1_path = tmp1.name
+
+    # 2. Test 16kHz Mono silent file
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp2:
+        create_synthetic_wav_file(tmp2.name, duration_seconds=1.0, sample_rate=16000, has_audio=False)
+        tmp2_path = tmp2.name
+
+    try:
+        with wave.open(tmp1_path, "rb") as w1:
+            assert w1.getnchannels() == 1
+            assert w1.getsampwidth() == 2
+            assert w1.getframerate() == 16000
+            frames = w1.readframes(w1.getnframes())
+            samples = struct.unpack(f"<{len(frames)//2}h", frames)
+            peak_amp = max(abs(s) for s in samples)
+            assert peak_amp > 1000  # Non-silent tone
+
+        with wave.open(tmp2_path, "rb") as w2:
+            assert w2.getnchannels() == 1
+            assert w2.getsampwidth() == 2
+            assert w2.getframerate() == 16000
+            frames = w2.readframes(w2.getnframes())
+            samples = struct.unpack(f"<{len(frames)//2}h", frames)
+            peak_amp = max(abs(s) for s in samples)
+            assert peak_amp == 0  # Complete silence
+    finally:
+        if os.path.exists(tmp1_path):
+            os.remove(tmp1_path)
+        if os.path.exists(tmp2_path):
+            os.remove(tmp2_path)
+

@@ -220,17 +220,17 @@ class EmailService:
         target_provider = provider_override or self._get_configured_provider()
 
         logger.info(
-            "[EmailService] Initiating email delivery (ID: %s) for event '%s' via %s to '%s'",
+            "[EmailService] Initiating email delivery preparation (ID: %s) for event '%s' via provider '%s' to recipient '%s'",
             delivery_id,
             event_id,
-            target_provider,
+            target_provider.value if hasattr(target_provider, "value") else target_provider,
             recipient_email,
         )
 
         # Recipient address validation (TC #19)
         if not self.validate_email_address(recipient_email):
             err_msg = f"Invalid or missing recipient email address '{recipient_email}'."
-            logger.error("[EmailService] %s", err_msg)
+            logger.error("[EmailService] [Validation] %s", err_msg)
             return DeliveryRecord(
                 delivery_id=delivery_id,
                 event_id=event_id,
@@ -243,7 +243,7 @@ class EmailService:
         # Summary availability validation
         if not summary or getattr(summary, "status", None) == "failed":
             err_msg = "Meeting summary unavailable because transcript/Claude summary was not generated."
-            logger.error("[EmailService] %s", err_msg)
+            logger.error("[EmailService] [Validation] %s", err_msg)
             return DeliveryRecord(
                 delivery_id=delivery_id,
                 event_id=event_id,
@@ -254,6 +254,8 @@ class EmailService:
             )
 
         subject = f"Meeting Summary: {meeting_title}"
+        logger.info("[EmailService] Email preparation started: Subject='%s', Recipient='%s'", subject, recipient_email.strip())
+
         body_html = self.render_summary_email_html(summary, meeting_title, recording_url, transcript_url)
         body_text = f"Meeting Summary: {meeting_title}\n\nOverview:\n{summary.overview}\n\nKey Points:\n" + "\n".join(f"- {kp}" for kp in summary.key_points)
 
@@ -268,6 +270,7 @@ class EmailService:
         # Retry loop for transient provider errors
         last_error = ""
         for attempt in range(1, max_retries + 1):
+            logger.info("[EmailService] Send attempt %d/%d starting via %s to '%s'", attempt, max_retries, target_provider, recipient_email.strip())
             try:
                 if target_provider == DeliveryProvider.MOCK:
                     self.mock_sent_emails.append(payload)
@@ -310,7 +313,7 @@ class EmailService:
 
             except Exception as exc:
                 last_error = str(exc)
-                logger.warning("[EmailService] Delivery attempt %d/%d failed via %s: %s", attempt, max_retries, target_provider, exc)
+                logger.warning("[EmailService] Send attempt %d/%d failed via %s: %s", attempt, max_retries, target_provider, exc)
 
         err_msg = f"Delivery failed after {max_retries} attempts. Last error: {last_error}"
         logger.error("[EmailService] %s", err_msg)
@@ -335,14 +338,19 @@ class EmailService:
 
     async def _send_via_graph_api(self, payload: EmailPayload) -> None:
         """Send email via Microsoft Graph API POST /v1.0/users/{sender}/sendMail endpoint."""
+        logger.info("[EmailService] [GRAPH] Acquiring Entra ID access token for Graph sendMail...")
         try:
             token = entra_auth_service.get_access_token()
         except Exception as exc:
-            raise EmailServiceError(f"Entra ID Token acquisition failed: {str(exc)}")
+            err_details = f"Entra ID Token acquisition failed: {str(exc)}"
+            logger.error("[EmailService] [GRAPH] %s", err_details)
+            raise EmailServiceError(err_details)
 
         sender_email = self.settings.email_sender_address or self.settings.azure_bot_user_email or "me"
         sender_name = self.settings.email_sender_name or "TekMeet"
         url = f"https://graph.microsoft.com/v1.0/users/{sender_email}/sendMail"
+
+        logger.info("[EmailService] [GRAPH] Provider connection established. Sending POST request to %s (Sender: '%s', Recipient: '%s')", url, sender_email, payload.recipient_email)
 
         headers = {
             "Authorization": f"Bearer {token}",
@@ -367,7 +375,10 @@ class EmailService:
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(url, headers=headers, json=graph_payload)
             if resp.status_code not in (200, 202):
-                raise EmailServiceError(f"Graph sendMail API returned HTTP {resp.status_code}: {resp.text}", status_code=resp.status_code)
+                err_msg = f"Graph sendMail API returned HTTP {resp.status_code}: {resp.text}"
+                logger.error("[EmailService] [GRAPH] %s", err_msg)
+                raise EmailServiceError(err_msg, status_code=resp.status_code)
+            logger.info("[EmailService] [GRAPH] Provider accepted mail request with HTTP %d for recipient '%s'", resp.status_code, payload.recipient_email)
 
     def _send_via_smtp(self, payload: EmailPayload) -> None:
         """Send email via standard SMTP server."""
@@ -375,6 +386,15 @@ class EmailService:
             raise EmailServiceError("SMTP Host is not configured in settings (SMTP_HOST).")
 
         from_email = self.settings.smtp_from_email or self.settings.smtp_username or "noreply@tekmeet.local"
+
+        logger.info(
+            "[EmailService] [SMTP] Connecting to SMTP host '%s:%d' (TLS: %s, From: '%s', Recipient: '%s')",
+            self.settings.smtp_host,
+            self.settings.smtp_port,
+            self.settings.smtp_use_tls,
+            from_email,
+            payload.recipient_email,
+        )
 
         msg = MIMEMultipart("alternative")
         msg["Subject"] = payload.subject
@@ -391,6 +411,7 @@ class EmailService:
                 pass_str = self.settings.smtp_password.get_secret_value()
                 server.login(self.settings.smtp_username, pass_str)
             server.sendmail(from_email, [payload.recipient_email], msg.as_string())
+            logger.info("[EmailService] [SMTP] SMTP sendmail completed successfully for recipient '%s'", payload.recipient_email)
 
 
 # Global singleton instance

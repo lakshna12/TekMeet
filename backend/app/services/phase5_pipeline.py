@@ -9,9 +9,12 @@ Provides deduplication, idempotent duplicate meeting protection, transient retry
 and graceful degradation so delivery failures never delete completed transcripts or summaries.
 """
 
+import hashlib
 import logging
+import re
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Dict, List, Optional
 from pydantic import BaseModel, Field
 
@@ -64,12 +67,39 @@ class Phase5Pipeline:
     def _resolve_organizer_email(self, job: Optional[ScheduledMeetingJob], direct_email: Optional[str] = None) -> Optional[str]:
         """Determine recipient email address using job.organizer_email with settings fallback."""
         if direct_email and direct_email.strip():
-            return direct_email.strip()
+            email = direct_email.strip()
+            if email != "organizer@tekmeet.local":
+                return email
         if job and job.organizer_email and job.organizer_email.strip():
-            return job.organizer_email.strip()
+            email = job.organizer_email.strip()
+            if email != "organizer@tekmeet.local":
+                return email
+        if self.settings.email_sender_address and self.settings.email_sender_address.strip():
+            return self.settings.email_sender_address.strip()
         if self.settings.azure_bot_user_email and self.settings.azure_bot_user_email.strip():
             return self.settings.azure_bot_user_email.strip()
         return None
+
+    def _compute_sha256_and_meta(self, file_path_or_name: str, file_bytes: Optional[bytes]) -> tuple[str, int, float]:
+        """Calculate SHA256 checksum, file size, and duration if available."""
+        if file_bytes:
+            sha256 = hashlib.sha256(file_bytes).hexdigest()
+            size = len(file_bytes)
+            return sha256, size, 0.0
+
+        p = Path(file_path_or_name)
+        if p.exists() and p.is_file():
+            try:
+                data = p.read_bytes()
+                sha256 = hashlib.sha256(data).hexdigest()
+                size = len(data)
+                return sha256, size, 0.0
+            except Exception:
+                pass
+
+        # Fallback SHA256 from path name if file not readable yet
+        sha256 = hashlib.sha256(file_path_or_name.encode('utf-8')).hexdigest()
+        return sha256, 0, 0.0
 
     async def process_end_to_end_job(
         self,
@@ -88,23 +118,41 @@ class Phase5Pipeline:
         """Execute full End-to-End Phase 5 Pipeline:
         Audio -> STT Transcript -> Persist -> LLM Summary -> Persist -> Email Delivery -> Persist.
 
-        Idempotency: Prevents sending duplicate emails for the same event_id unless force_refresh is True.
+        Idempotency: Prevents sending duplicate emails for the exact same call_id / recording_file unless force_refresh is True.
         """
         pipeline_id = f"p5_{uuid.uuid4().hex[:12]}"
         target_event_id = event_id or (job.event_id if job else f"event_{uuid.uuid4().hex[:8]}")
         target_call_id = call_id or (job.call_id if job else None)
         title = meeting_title or (job.subject if job else "Teams Meeting")
-        target_recording_file = file_path_or_name or f"meeting_{target_event_id}.wav"
+
+        safe_title = re.sub(r'[^a-zA-Z0-9_\-]', '_', title).strip('_')
+        safe_title = safe_title if safe_title else "Teams_Meeting"
+
+        target_recording_file = file_path_or_name or f"{safe_title}_{target_event_id[:8]}.wav"
         recipient = self._resolve_organizer_email(job, organizer_email)
 
-        logger.info("[Phase5Pipeline] Starting E2E Pipeline (ID: %s) for event '%s' (Recipient: '%s')", pipeline_id, target_event_id, recipient)
+        logger.info("[Phase5Pipeline] Starting E2E Pipeline (ID: %s) for event '%s' call '%s' (File: '%s', Recipient: '%s')",
+                    pipeline_id, target_event_id, target_call_id, target_recording_file, recipient)
 
-        # Step 1: Idempotency & Duplicate Delivery Protection
-        existing_delivery = self.db_service.get_delivery_record(target_event_id)
+        sha256, file_size, duration = self._compute_sha256_and_meta(target_recording_file, file_bytes)
+
+        logger.info(
+            "[Pipeline Audio Source]\neventId=%s\ncallId=%s\nwavPath=%s\nfileName=%s\nfileSize=%d\nduration=%.1f\nsha256=%s",
+            target_event_id, target_call_id or "", target_recording_file, Path(target_recording_file).name, file_size, duration, sha256
+        )
+
+        # Step 1: Idempotency & Duplicate Delivery Protection (Check exact recording / call_id)
+        existing_delivery = None
+        if not force_refresh:
+            existing_delivery = (
+                self.db_service.get_delivery_record_by_recording(target_recording_file) or
+                (self.db_service.get_delivery_record_by_call_id(target_call_id) if target_call_id else None)
+            )
+
         if not force_refresh and existing_delivery and existing_delivery.status == DeliveryStatus.SENT:
-            logger.info("[Phase5Pipeline] Event '%s' has already been successfully delivered. Returning idempotent duplicate status.", target_event_id)
-            existing_transcript = self.db_service.get_transcript(target_event_id)
-            existing_summary = self.db_service.get_summary(target_event_id)
+            logger.info("[Phase5Pipeline] Call/Recording '%s' has already been successfully delivered. Returning idempotent duplicate status.", target_recording_file)
+            existing_transcript = self.db_service.get_transcript_by_recording(target_recording_file) or self.db_service.get_transcript(target_event_id)
+            existing_summary = self.db_service.get_summary_by_transcript_id(existing_transcript.transcript_id) if existing_transcript else None
             return Phase5PipelineResult(
                 pipeline_id=pipeline_id,
                 event_id=target_event_id,
@@ -118,9 +166,20 @@ class Phase5Pipeline:
             )
 
         # Step 2: Speech-to-Text Transcription
-        # Check existing transcript reuse
-        transcript = self.db_service.get_transcript(target_event_id) if not force_refresh else None
+        # Exact lookup for existing transcript for THIS recording or call_id
+        transcript = None
+        if not force_refresh:
+            transcript = (
+                self.db_service.get_transcript_by_recording(target_recording_file) or
+                (self.db_service.get_transcript_by_call_id(target_call_id) if target_call_id else None)
+            )
+
         if not transcript:
+            logger.info(
+                "[Deepgram Input]\neventId=%s\ncallId=%s\nwavPath=%s\nfileName=%s\nfileSize=%d\nduration=%.1f\nsha256=%s",
+                target_event_id, target_call_id or "", target_recording_file, Path(target_recording_file).name, file_size, duration, sha256
+            )
+
             transcript = await self.stt_service.transcribe_recording(
                 event_id=target_event_id,
                 file_path_or_name=target_recording_file,
@@ -130,6 +189,11 @@ class Phase5Pipeline:
             )
             self.db_service.save_transcript(transcript)
 
+        logger.info(
+            "[Deepgram Completed]\neventId=%s\ncallId=%s\ntranscriptId=%s\ntranscriptLength=%d\nsourceRecording=%s\nsourceSha256=%s",
+            target_event_id, target_call_id or "", transcript.transcript_id, len(transcript.full_text or ""), target_recording_file, sha256
+        )
+
         # Handle STT failure
         if transcript.status == TranscriptionStatus.FAILED:
             err_msg = f"Meeting summary unavailable because transcript/Claude summary was not generated (STT failed: {transcript.error_message or 'Unknown STT error'})."
@@ -137,6 +201,7 @@ class Phase5Pipeline:
             failed_delivery = DeliveryRecord(
                 delivery_id=f"del_{uuid.uuid4().hex[:12]}",
                 event_id=target_event_id,
+                call_id=target_call_id,
                 recipient_email=recipient or "missing@invalid",
                 status=DeliveryStatus.FAILED,
                 error_message=err_msg,
@@ -156,14 +221,27 @@ class Phase5Pipeline:
             )
 
         # Step 3: LLM Summarization
-        # Check existing summary reuse
-        summary = self.db_service.get_summary(target_event_id) if not force_refresh else None
+        # Look up existing summary for THIS exact transcript
+        summary = None
+        if not force_refresh:
+            summary = self.db_service.get_summary_by_transcript_id(transcript.transcript_id)
+
         if not summary:
+            logger.info(
+                "[Gemini Input]\neventId=%s\ncallId=%s\ntranscriptId=%s\ntranscriptLength=%d",
+                target_event_id, target_call_id or "", transcript.transcript_id, len(transcript.full_text or "")
+            )
+
             summary = await self.llm_service.summarize_transcript(
                 transcript=transcript,
                 mock_provider_override=mock_summary_override,
             )
             self.db_service.save_summary(summary)
+
+        logger.info(
+            "[Gemini Completed]\neventId=%s\ncallId=%s\ntranscriptId=%s\nsummaryId=%s",
+            target_event_id, target_call_id or "", transcript.transcript_id, summary.summary_id
+        )
 
         # Handle Summary failure
         if summary.status == SummarizationStatus.FAILED:
@@ -172,6 +250,7 @@ class Phase5Pipeline:
             failed_delivery = DeliveryRecord(
                 delivery_id=f"del_{uuid.uuid4().hex[:12]}",
                 event_id=target_event_id,
+                call_id=target_call_id,
                 recipient_email=recipient or "missing@invalid",
                 status=DeliveryStatus.FAILED,
                 error_message=err_msg,
@@ -201,6 +280,7 @@ class Phase5Pipeline:
             failed_delivery = DeliveryRecord(
                 delivery_id=f"del_{uuid.uuid4().hex[:12]}",
                 event_id=target_event_id,
+                call_id=target_call_id,
                 recipient_email=recipient or "missing@invalid",
                 status=DeliveryStatus.FAILED,
                 error_message=err_msg,
@@ -220,6 +300,11 @@ class Phase5Pipeline:
             )
 
         # Step 5: Email Delivery Stage
+        logger.info(
+            "[Email Delivery]\neventId=%s\ncallId=%s\ntranscriptId=%s\nsummaryId=%s",
+            target_event_id, target_call_id or "", transcript.transcript_id, summary.summary_id
+        )
+
         delivery_record = await self.mail_service.send_summary_email(
             event_id=target_event_id,
             recipient_email=recipient,
@@ -229,6 +314,8 @@ class Phase5Pipeline:
             transcript_url=transcript_view_url,
             provider_override=mock_email_provider,
         )
+        if target_call_id:
+            delivery_record.call_id = target_call_id
         self.db_service.save_delivery_record(delivery_record)
 
         overall_status = "completed" if delivery_record.status == DeliveryStatus.SENT else "partial"

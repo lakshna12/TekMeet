@@ -9,6 +9,7 @@ Transforms structured Transcript models into concise MeetingSummary objects cont
 Handles empty transcripts, missing API keys, long transcripts, API timeouts, and malformed responses.
 """
 
+import asyncio
 import json
 import logging
 import re
@@ -40,6 +41,28 @@ class SummarizationService:
 
     def __init__(self, app_settings: Optional[Settings] = None):
         self.settings = app_settings or settings
+
+    def _get_claude_key(self) -> Optional[str]:
+        """Retrieve Claude API key safely from settings."""
+        key = getattr(self.settings, "claude_api_key", None) or getattr(self.settings, "anthropic_api_key", None)
+        if key and hasattr(key, "get_secret_value"):
+            return key.get_secret_value()
+        if isinstance(key, str):
+            return key
+        return None
+
+    def _get_gemini_key(self) -> Optional[str]:
+        """Retrieve Gemini API key safely from settings."""
+        key = getattr(self.settings, "gemini_api_key", None)
+        if key and hasattr(key, "get_secret_value"):
+            return key.get_secret_value()
+        if isinstance(key, str):
+            return key
+        return None
+
+    def _get_api_key(self) -> Optional[str]:
+        """Retrieve primary API key (Claude or Gemini)."""
+        return self._get_claude_key() or self._get_gemini_key()
 
     async def summarize_transcript(
         self,
@@ -126,11 +149,24 @@ class SummarizationService:
             )
             processed_text = processed_text[:MAX_TRANSCRIPT_CHARS] + "\n\n[...Transcript truncated for length...]"
 
-        # Step 5: Invoke Anthropic Claude API
+        # Step 5: Invoke Google Gemini LLM Summarization API
         try:
-            logger.info("[SummarizationService] Invoking Claude API (%s)...", self.settings.claude_model)
-            raw_response_text = await self._call_claude_api(api_key=api_key, transcript_text=processed_text)
-            
+            gemini_key = self._get_gemini_key()
+
+            if gemini_key:
+                logger.info("[SummarizationService] Invoking Google Gemini API (%s)...", self.settings.gemini_model)
+                raw_response_text = await self._call_gemini_api(api_key=gemini_key, transcript_text=processed_text)
+            else:
+                err_msg = "Google Gemini API Key (GEMINI_API_KEY) is not configured."
+                logger.error("[SummarizationService] %s", err_msg)
+                return MeetingSummary(
+                    summary_id=summary_id,
+                    event_id=transcript.event_id,
+                    transcript_id=transcript.transcript_id,
+                    status=SummarizationStatus.FAILED,
+                    error_message=err_msg,
+                )
+
             # Step 6: Parse structured JSON from response
             summary_dict = self._parse_json_response(raw_response_text)
 
@@ -142,25 +178,45 @@ class SummarizationService:
             )
 
         except Exception as exc:
-            safe_err = str(exc).replace(api_key, "[REDACTED_API_KEY]")
-            logger.error("[SummarizationService] Error calling Claude API for event '%s': %s", transcript.event_id, safe_err)
+            redacted_err = str(exc)
+            claude_key = self._get_claude_key()
+            gemini_key = self._get_gemini_key()
+            if claude_key:
+                redacted_err = redacted_err.replace(claude_key, "[REDACTED_API_KEY]")
+            if gemini_key:
+                redacted_err = redacted_err.replace(gemini_key, "[REDACTED_API_KEY]")
+            logger.error("[SummarizationService] Error calling LLM API for event '%s': %s", transcript.event_id, redacted_err)
             return MeetingSummary(
                 summary_id=summary_id,
                 event_id=transcript.event_id,
                 transcript_id=transcript.transcript_id,
                 status=SummarizationStatus.FAILED,
-                error_message=f"Claude API error: {safe_err}",
+                error_message=f"LLM API error: {redacted_err}",
             )
 
-    def _get_api_key(self) -> Optional[str]:
+    def _get_claude_key(self) -> Optional[str]:
         """Retrieve configured Claude/Anthropic API key from settings."""
-        if self.settings.claude_api_key and self.settings.claude_api_key.get_secret_value().strip():
-            return self.settings.claude_api_key.get_secret_value().strip()
-        if self.settings.anthropic_api_key and self.settings.anthropic_api_key.get_secret_value().strip():
-            return self.settings.anthropic_api_key.get_secret_value().strip()
-        if self.settings.gemini_api_key and self.settings.gemini_api_key.get_secret_value().strip():
-            return self.settings.gemini_api_key.get_secret_value().strip()
+        key = getattr(self.settings, "claude_api_key", None) or getattr(self.settings, "anthropic_api_key", None)
+        if key and hasattr(key, "get_secret_value"):
+            val = key.get_secret_value()
+            return val.strip() if val else None
+        if isinstance(key, str) and key.strip():
+            return key.strip()
         return None
+
+    def _get_gemini_key(self) -> Optional[str]:
+        """Retrieve configured Gemini API key from settings."""
+        key = getattr(self.settings, "gemini_api_key", None)
+        if key and hasattr(key, "get_secret_value"):
+            val = key.get_secret_value()
+            return val.strip() if val else None
+        if isinstance(key, str) and key.strip():
+            return key.strip()
+        return None
+
+    def _get_api_key(self) -> Optional[str]:
+        """Retrieve configured Claude or Gemini API key from settings."""
+        return self._get_claude_key() or self._get_gemini_key()
 
     async def _call_claude_api(self, api_key: str, transcript_text: str) -> str:
         """Send HTTP POST request to Anthropic Claude Messages REST API."""
@@ -184,13 +240,11 @@ class SummarizationService:
         )
 
         url = "https://api.anthropic.com/v1/messages"
-        
         headers = {
             "x-api-key": api_key,
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         }
-
         payload = {
             "model": self.settings.claude_model,
             "max_tokens": 1500,
@@ -217,6 +271,83 @@ class SummarizationService:
                 raise SummarizationServiceError("Claude API response missing text in content blocks.")
 
             return content_blocks[0]["text"]
+
+    async def _call_gemini_api(self, api_key: str, transcript_text: str) -> str:
+        """Send HTTP POST request to Google Gemini REST API with retry support for transient 503 spikes."""
+        prompt = (
+            "You are summarizing a Teams meeting. Use ONLY the provided meeting transcript. "
+            "Do not use application logs, system events, meeting metadata, recording status, bot status, "
+            "API responses, or any information outside the transcript. Do not invent missing information.\n\n"
+            "STRICT FACTUALITY RULES:\n"
+            "- Extract ONLY facts, key discussion points, decisions, and action items explicitly stated in the transcript.\n"
+            "- Do NOT invent or infer information, assignees, deadlines, or decisions not present.\n"
+            "- If assignee or deadline is not mentioned for an action item, set it to null.\n"
+            "- If no decisions were explicitly made in the transcript, return an empty list for decisions.\n\n"
+            "OUTPUT FORMAT:\n"
+            "You MUST respond ONLY with a valid JSON object adhering to this exact JSON schema (no markdown wrap, no conversation text):\n"
+            "{\n"
+            '  "overview": "Concise executive summary paragraph (2-4 sentences based ONLY on transcript content)",\n'
+            '  "key_points": ["Actual topic discussed 1", "Actual topic discussed 2"],\n'
+            '  "action_items": [{"task": "Task description from transcript", "assignee": "Name or null", "deadline": "Date/Time or null"}],\n'
+            '  "decisions": [{"title": "Decision title", "details": "Context or null"}]\n'
+            "}\n\n"
+            f"MEETING TRANSCRIPT:\n{transcript_text}"
+        )
+
+        models_to_try = [self.settings.gemini_model, "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro", "gemini-flash-latest"]
+        # Deduplicate while preserving order
+        unique_models = []
+        for m in models_to_try:
+            if m and m not in unique_models:
+                unique_models.append(m)
+
+        last_error = None
+        for model in unique_models:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+            headers = {"Content-Type": "application/json"}
+            payload = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "temperature": 0.2,
+                    "maxOutputTokens": 1500,
+                    "responseMimeType": "application/json",
+                },
+            }
+            params = {"key": api_key}
+
+            max_attempts = 2
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    async with httpx.AsyncClient(timeout=45.0) as client:
+                        resp = await client.post(url, headers=headers, json=payload, params=params)
+                        if resp.status_code == 200:
+                            res_data = resp.json()
+                            candidates = res_data.get("candidates", [])
+                            if not candidates or "content" not in candidates[0]:
+                                raise SummarizationServiceError("Gemini API response missing candidates content block.")
+
+                            parts = candidates[0]["content"].get("parts", [])
+                            if not parts or "text" not in parts[0]:
+                                raise SummarizationServiceError("Gemini API response missing text in content parts.")
+
+                            return parts[0]["text"]
+
+                        elif resp.status_code in (503, 404, 429) and attempt < max_attempts:
+                            logger.warning(
+                                "[SummarizationService] Gemini API model '%s' returned HTTP %d (attempt %d/%d). Retrying in 2s...",
+                                model, resp.status_code, attempt, max_attempts
+                            )
+                            await asyncio.sleep(2.0)
+                        else:
+                            last_error = f"Gemini API model '{model}' returned status HTTP {resp.status_code}: {resp.text.replace(api_key, '[REDACTED_API_KEY]')}"
+                            logger.warning("[SummarizationService] %s. Trying fallback model...", last_error)
+                            break
+                except Exception as exc:
+                    last_error = f"Gemini model '{model}' request exception: {exc}"
+                    logger.warning("[SummarizationService] %s", last_error)
+                    break
+
+        raise SummarizationServiceError(f"Gemini API call failed after trying models: {last_error}")
 
     def _parse_json_response(self, text: str) -> dict:
         """Parse JSON from raw Gemini response string, stripping markdown if present."""

@@ -242,3 +242,26 @@ async def test_join_meeting_network_error(mock_settings, mock_auth):
     assert record.error_code == "network_error"
     assert record.call_id is None
     assert record.http_status is None
+
+
+@pytest.mark.asyncio
+async def test_audiosocket_per_call_lifecycle_and_blob_uniqueness(mock_settings, mock_auth):
+    """Verify consecutive media config requests fetch distinct media blobs and call parameters."""
+    service = GraphCallingService(auth_service=mock_auth, app_settings=mock_settings)
+
+    mock_resp1 = MagicMock()
+    mock_resp1.status_code = 200
+    mock_resp1.json.return_value = {"blob": "blob_call_1_uuid_aaa", "initialized": True}
+
+    mock_resp2 = MagicMock()
+    mock_resp2.status_code = 200
+    mock_resp2.json.return_value = {"blob": "blob_call_2_uuid_bbb", "initialized": True}
+
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock, side_effect=[mock_resp1, mock_resp2]):
+        blob1 = await service.fetch_media_worker_config_blob()
+        blob2 = await service.fetch_media_worker_config_blob()
+
+    assert blob1 == "blob_call_1_uuid_aaa"
+    assert blob2 == "blob_call_2_uuid_bbb"
+    assert blob1 != blob2
+

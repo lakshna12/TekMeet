@@ -40,6 +40,8 @@ class DeliveryRecord(BaseModel):
 
     delivery_id: str = Field(..., description="Unique delivery attempt ID")
     event_id: str = Field(..., description="Associated meeting event ID")
+    call_id: Optional[str] = Field(None, description="Graph call ID")
+    recording_file: Optional[str] = Field(None, description="Finalized recording file")
     recipient_email: str = Field(..., description="Target recipient email address")
     provider: DeliveryProvider = Field(default=DeliveryProvider.GRAPH, description="Delivery provider used")
     status: DeliveryStatus = Field(default=DeliveryStatus.PENDING, description="Current status of the delivery")

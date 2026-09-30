@@ -71,6 +71,8 @@ class MeetingDispatcher:
         self._jobs: Dict[str, ScheduledMeetingJob] = {}
         # Background task set to prevent premature garbage collection of pipeline tasks
         self._pipeline_tasks: Set[asyncio.Task] = set()
+        # Active pipeline tracker to prevent duplicate concurrent runs for the same event
+        self._running_pipelines: Set[str] = set()
 
     def get_all_jobs(self) -> List[ScheduledMeetingJob]:
         """Return all tracked meeting jobs sorted by scheduled start time."""
@@ -81,6 +83,13 @@ class MeetingDispatcher:
     def get_job(self, event_id: str) -> Optional[ScheduledMeetingJob]:
         """Retrieve a specific meeting job by event ID."""
         return self._jobs.get(event_id)
+
+    def get_job_by_call_id(self, call_id: str) -> Optional[ScheduledMeetingJob]:
+        """Retrieve a specific meeting job by its Graph call ID."""
+        for job in self._jobs.values():
+            if job.call_id == call_id:
+                return job
+        return None
 
     def get_jobs_by_status(self, status: MeetingStatus) -> List[ScheduledMeetingJob]:
         """Retrieve all jobs with a given lifecycle status."""
@@ -118,8 +127,15 @@ class MeetingDispatcher:
             start_dt = m.start_time or current_time
             end_dt = m.end_time or (start_dt + timedelta(hours=1))
 
-            if m.event_id in self._jobs:
-                existing_job = self._jobs[m.event_id]
+            # Check by event_id or by matching join_url
+            existing_job = self._jobs.get(m.event_id)
+            if not existing_job and m.join_url:
+                for j in self._jobs.values():
+                    if j.join_url and j.join_url.strip() == m.join_url.strip():
+                        existing_job = j
+                        break
+
+            if existing_job:
                 # Update details if subject or URL changed
                 existing_job.subject = m.subject or existing_job.subject
                 existing_job.join_url = m.join_url or existing_job.join_url
@@ -222,10 +238,28 @@ class MeetingDispatcher:
                     job.updated_at = current_time
 
             elif job.status == MeetingStatus.TRIGGERED:
+                concluded = False
                 if current_time > job.end_time:
+                    concluded = True
+                elif self.settings.use_app_hosted_media:
+                    # Query MediaWorker status to detect early call disconnect
+                    try:
+                        async with httpx.AsyncClient(timeout=2.0) as client:
+                            resp = await client.get(f"{self.settings.media_worker_url}/api/media/status")
+                            if resp.status_code == 200:
+                                data = resp.json()
+                                is_recording = data.get("isRecording", False)
+                                elapsed = (current_time - job.dispatched_at).total_seconds() if job.dispatched_at else 0
+                                if not is_recording and elapsed > 20:
+                                    logger.info("[MeetingDispatcher] MediaWorker reports recording finished for job %s (elapsed: %.1fs). Marking COMPLETED.", job.event_id, elapsed)
+                                    concluded = True
+                    except Exception as exc:
+                        logger.debug("[MeetingDispatcher] MediaWorker status check exception for job %s: %s", job.event_id, exc)
+
+                if concluded:
                     # Meeting was triggered and has now concluded
                     job.status = MeetingStatus.COMPLETED
-                    job.dispatch_message = f"Completed at {job.end_time.strftime('%Y-%m-%dT%H:%M:%SZ')}"
+                    job.dispatch_message = f"Completed at {current_time.strftime('%Y-%m-%dT%H:%M:%SZ')}"
                     job.updated_at = current_time
 
                     # Automatically trigger Phase 5 End-to-End Pipeline in background
@@ -310,37 +344,54 @@ class MeetingDispatcher:
     async def trigger_phase5_pipeline(
         self,
         job: ScheduledMeetingJob,
+        file_path_or_name: Optional[str] = None,
         force_refresh: bool = False,
         max_readiness_attempts: int = 5,
         readiness_delay_seconds: float = 0.5,
     ) -> Optional[Phase5PipelineResult]:
         """Finalize recording on MediaWorker if needed, wait for recording readiness, then execute Phase 5 E2E pipeline for job."""
-        logger.info(
-            "[MeetingDispatcher] Meeting '%s' (%s) concluded and set to COMPLETED. Finalizing recording & triggering Phase 5 Pipeline.",
-            job.subject,
-            job.event_id,
-        )
+        if job.event_id in self._running_pipelines:
+            logger.info("[MeetingDispatcher] Phase 5 Pipeline is ALREADY running for event '%s'. Skipping duplicate execution.", job.event_id)
+            return None
 
-        # 1. Finalize recording on MediaWorker
-        if self.settings.use_app_hosted_media:
-            try:
-                stop_url = f"{self.settings.media_worker_url}/api/media/recording/stop"
-                async with httpx.AsyncClient(timeout=5.0) as client:
-                    resp = await client.get(stop_url)
-                    logger.info("[MeetingDispatcher] MediaWorker recording finalization response for job %s: %s", job.event_id, resp.text)
-            except Exception as exc:
-                logger.warning("[MeetingDispatcher] Could not trigger MediaWorker StopRecording for job %s: %s", job.event_id, exc)
+        self._running_pipelines.add(job.event_id)
+        logger.info("[Meeting Ended] Automatically detected meeting end for '%s' (EventId: %s)", job.subject, job.event_id)
 
-        # 2. Check recording file readiness (bounded retry loop)
-        await self.check_recording_readiness(
-            event_id=job.event_id,
-            max_attempts=max_readiness_attempts,
-            delay_seconds=readiness_delay_seconds,
-        )
-
-        # 3. Execute Phase 5 Pipeline
         try:
-            result = await self.pipeline.process_end_to_end_job(job=job, force_refresh=force_refresh)
+            # 1. Finalize recording on MediaWorker
+            if self.settings.use_app_hosted_media:
+                try:
+                    stop_url = f"{self.settings.media_worker_url}/api/media/recording/stop"
+                    async with httpx.AsyncClient(timeout=5.0) as client:
+                        resp = await client.get(stop_url)
+                        logger.info("[Recording Finalized] MediaWorker recording finalization response for job %s: %s", job.event_id, resp.text)
+                except Exception as exc:
+                    logger.warning("[MeetingDispatcher] Could not trigger MediaWorker StopRecording for job %s: %s", job.event_id, exc)
+
+            # 2. Check recording file readiness (bounded retry loop)
+            await self.check_recording_readiness(
+                event_id=job.event_id,
+                file_path_or_name=file_path_or_name,
+                max_attempts=max_readiness_attempts,
+                delay_seconds=readiness_delay_seconds,
+            )
+
+            # 3. Execute Phase 5 Pipeline
+            kwargs = {"job": job, "force_refresh": force_refresh}
+            if file_path_or_name:
+                kwargs["file_path_or_name"] = file_path_or_name
+
+            result = await self.pipeline.process_end_to_end_job(**kwargs)
+
+            if result.transcript and result.transcript.status.value == "completed":
+                logger.info("[Deepgram Completed] STT transcript generated for event %s (%d segments)", job.event_id, len(result.transcript.segments))
+
+            if result.summary and result.summary.status.value == "completed":
+                logger.info("[Gemini Completed] LLM meeting summary generated for event %s", job.event_id)
+
+            if result.delivery_record and result.delivery_record.status.value == "sent":
+                logger.info("[Email Sent] Summary email sent to '%s' for event %s", result.recipient_email, job.event_id)
+
             logger.info(
                 "[MeetingDispatcher] Phase 5 Pipeline finished for event %s | Status: %s | Pipeline ID: %s",
                 job.event_id,
@@ -351,6 +402,8 @@ class MeetingDispatcher:
         except Exception as exc:
             logger.exception("[MeetingDispatcher] Exception running Phase 5 Pipeline for event %s: %s", job.event_id, exc)
             return None
+        finally:
+            self._running_pipelines.discard(job.event_id)
 
     async def wait_for_active_pipelines(self) -> None:
         """Wait for all active background Phase 5 pipeline tasks to finish."""
