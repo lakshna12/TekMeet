@@ -18,6 +18,12 @@ namespace MediaWorker
             Directory.SetCurrentDirectory(AppDomain.CurrentDomain.BaseDirectory);
             LoadDotEnv();
 
+            if (Array.Exists(args, a => a.Equals("--test", StringComparison.OrdinalIgnoreCase)))
+            {
+                AudioRecordingServiceTests.RunAllTests();
+                return;
+            }
+
             var host = Host.CreateDefaultBuilder(args)
                 .UseWindowsService()
                 .ConfigureServices((context, services) =>
@@ -98,16 +104,7 @@ namespace MediaWorker
 
                 var path = req.Url.AbsolutePath.ToLowerInvariant();
 
-                if (path == "/health" || path == "/")
-                {
-                    string json = $"{{\"status\":\"healthy\",\"mediaPlatformInitialized\":{mediaHost.IsInitialized.ToString().ToLower()}}}";
-                    byte[] buf = Encoding.UTF8.GetBytes(json);
-                    resp.OutputStream.Write(buf, 0, buf.Length);
-                    resp.Close();
-                    return;
-                }
-
-                if (path == "/api/media/status")
+                if (path == "/health" || path == "/" || path == "/api/media/status")
                 {
                     var payload = new {
                         status = "healthy",

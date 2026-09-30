@@ -57,10 +57,13 @@ class TeamsCallJoinHandler:
             return True
 
         logger.info(
-            "[TeamsCallJoinHandler] Initiating join for meeting '%s' (event_id: %s, start: %s)",
-            job.subject,
+            "[DISPATCHER] Starting meeting join\n"
+            "[DISPATCHER] Event ID: %s\n"
+            "[DISPATCHER] Join URL detected\n"
+            "[GRAPH] Joining Teams meeting\n"
+            "[GRAPH] Event ID: %s",
             job.event_id,
-            job.start_time.isoformat(),
+            job.event_id,
         )
 
         record = await self.calling_service.join_meeting(
@@ -71,33 +74,70 @@ class TeamsCallJoinHandler:
         if record.state not in (CallState.FAILED,) and record.call_id:
             # Success — store the Graph call ID back onto the job for tracking
             job.call_id = record.call_id
+            state_str = record.state.value if hasattr(record.state, "value") else str(record.state)
             logger.info(
-                "[TeamsCallJoinHandler] Successfully joined meeting '%s' | call_id: %s | state: %s",
-                job.subject,
+                "[GRAPH] Teams join successful\n"
+                "[GRAPH] Call ID: %s\n"
+                "[GRAPH] Initial call state: %s\n"
+                "[DISPATCHER] Graph join successful\n"
+                "[DISPATCHER] Call ID: %s",
                 record.call_id,
-                record.state,
+                state_str,
+                record.call_id,
             )
 
             # In Phase 3 (App-Hosted Media), trigger MediaWorker to start recording audio to a .wav file
             from app.core.config import settings
             import httpx
             if settings.use_app_hosted_media:
+                rec_path = f"meeting_{job.event_id}.wav"
+                logger.info(
+                    "[RECORDING] Starting recording\n"
+                    "[RECORDING] Event ID: %s\n"
+                    "[RECORDING] Call ID: %s\n"
+                    "[DISPATCHER] Starting MediaWorker recording\n"
+                    "[DISPATCHER] Event ID: %s\n"
+                    "[DISPATCHER] Call ID: %s",
+                    job.event_id,
+                    record.call_id,
+                    job.event_id,
+                    record.call_id,
+                )
                 try:
                     async with httpx.AsyncClient(timeout=5.0) as client:
                         rec_url = f"{settings.media_worker_url}/api/media/recording/start?eventId={job.event_id}&callId={record.call_id}"
                         resp = await client.get(rec_url)
-                        logger.info("[TeamsCallJoinHandler] Triggered MediaWorker StartRecording: %s", resp.text)
+                        if resp.status_code == 200:
+                            logger.info(
+                                "[DISPATCHER] Recording started successfully\n"
+                                "[DISPATCHER] Recording path: %s",
+                                rec_path,
+                            )
+                        else:
+                            logger.error(
+                                "[MEDIA] Recording start FAILED\n"
+                                "[MEDIA] HTTP status: %d\n"
+                                "[MEDIA] Error: %s",
+                                resp.status_code,
+                                resp.text,
+                            )
                 except Exception as exc:
-                    logger.warning("[TeamsCallJoinHandler] Failed to trigger MediaWorker StartRecording: %s", exc)
+                    logger.error(
+                        "[MEDIA] Recording start FAILED\n"
+                        "[MEDIA] Error: %s\n"
+                        "[DISPATCHER] ERROR: Failed to start MediaWorker recording - %s",
+                        exc,
+                        exc,
+                    )
 
             return True
 
+        err_detail = f"http_status: {record.http_status} | error: {record.error_code} - {record.error_message}"
         logger.error(
-            "[TeamsCallJoinHandler] Failed to join meeting '%s' | http_status: %s | error: %s - %s",
-            job.subject,
-            record.http_status,
-            record.error_code,
-            record.error_message,
+            "[GRAPH] ERROR: Failed to join Teams meeting - %s\n"
+            "[DISPATCHER] ERROR: Graph join failed - %s",
+            err_detail,
+            err_detail,
         )
         return False
 

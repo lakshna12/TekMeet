@@ -131,15 +131,28 @@ class Phase5Pipeline:
         target_recording_file = file_path_or_name or f"{safe_title}_{target_event_id[:8]}.wav"
         recipient = self._resolve_organizer_email(job, organizer_email)
 
-        logger.info("[Phase5Pipeline] Starting E2E Pipeline (ID: %s) for event '%s' call '%s' (File: '%s', Recipient: '%s')",
-                    pipeline_id, target_event_id, target_call_id, target_recording_file, recipient)
+        logger.info(
+            "[PHASE5] Starting post-meeting pipeline\n"
+            "[PHASE5] Event ID: %s\n"
+            "[PHASE5] Call ID: %s\n"
+            "[PHASE5] Recording: %s",
+            target_event_id,
+            target_call_id or "N/A",
+            target_recording_file,
+        )
 
         sha256, file_size, duration = self._compute_sha256_and_meta(target_recording_file, file_bytes)
 
         logger.info(
-            "[Pipeline Audio Source]\neventId=%s\ncallId=%s\nwavPath=%s\nfileName=%s\nfileSize=%d\nduration=%.1f\nsha256=%s",
-            target_event_id, target_call_id or "", target_recording_file, Path(target_recording_file).name, file_size, duration, sha256
+            "[PHASE5] Validating recording\n"
+            "[PHASE5] File size: %d bytes\n"
+            "[PHASE5] Duration: %.1fs\n"
+            "[PHASE5] SHA256: %s",
+            file_size,
+            duration,
+            sha256,
         )
+        logger.info("[PHASE5] Recording validation successful")
 
         # Step 1: Idempotency & Duplicate Delivery Protection (Check exact recording / call_id)
         existing_delivery = None
@@ -166,7 +179,6 @@ class Phase5Pipeline:
             )
 
         # Step 2: Speech-to-Text Transcription
-        # Exact lookup for existing transcript for THIS recording or call_id
         transcript = None
         if not force_refresh:
             transcript = (
@@ -175,11 +187,6 @@ class Phase5Pipeline:
             )
 
         if not transcript:
-            logger.info(
-                "[Deepgram Input]\neventId=%s\ncallId=%s\nwavPath=%s\nfileName=%s\nfileSize=%d\nduration=%.1f\nsha256=%s",
-                target_event_id, target_call_id or "", target_recording_file, Path(target_recording_file).name, file_size, duration, sha256
-            )
-
             transcript = await self.stt_service.transcribe_recording(
                 event_id=target_event_id,
                 file_path_or_name=target_recording_file,
@@ -189,15 +196,20 @@ class Phase5Pipeline:
             )
             self.db_service.save_transcript(transcript)
 
-        logger.info(
-            "[Deepgram Completed]\neventId=%s\ncallId=%s\ntranscriptId=%s\ntranscriptLength=%d\nsourceRecording=%s\nsourceSha256=%s",
-            target_event_id, target_call_id or "", transcript.transcript_id, len(transcript.full_text or ""), target_recording_file, sha256
-        )
-
         # Handle STT failure
         if transcript.status == TranscriptionStatus.FAILED:
             err_msg = f"Meeting summary unavailable because transcript/Claude summary was not generated (STT failed: {transcript.error_message or 'Unknown STT error'})."
-            logger.error("[Phase5Pipeline] E2E Pipeline failed at STT stage for event '%s': %s", target_event_id, err_msg)
+            logger.error(
+                "========== TEKMEET PIPELINE FAILED ==========\n"
+                "Event ID: %s\n"
+                "Call ID: %s\n"
+                "Failed Stage: Deepgram Transcription\n"
+                "Reason: %s\n"
+                "=======================",
+                target_event_id,
+                target_call_id or "N/A",
+                err_msg,
+            )
             failed_delivery = DeliveryRecord(
                 delivery_id=f"del_{uuid.uuid4().hex[:12]}",
                 event_id=target_event_id,
@@ -221,32 +233,31 @@ class Phase5Pipeline:
             )
 
         # Step 3: LLM Summarization
-        # Look up existing summary for THIS exact transcript
         summary = None
         if not force_refresh:
             summary = self.db_service.get_summary_by_transcript_id(transcript.transcript_id)
 
         if not summary:
-            logger.info(
-                "[Gemini Input]\neventId=%s\ncallId=%s\ntranscriptId=%s\ntranscriptLength=%d",
-                target_event_id, target_call_id or "", transcript.transcript_id, len(transcript.full_text or "")
-            )
-
             summary = await self.llm_service.summarize_transcript(
                 transcript=transcript,
                 mock_provider_override=mock_summary_override,
             )
             self.db_service.save_summary(summary)
 
-        logger.info(
-            "[Gemini Completed]\neventId=%s\ncallId=%s\ntranscriptId=%s\nsummaryId=%s",
-            target_event_id, target_call_id or "", transcript.transcript_id, summary.summary_id
-        )
-
         # Handle Summary failure
         if summary.status == SummarizationStatus.FAILED:
             err_msg = f"Meeting summary unavailable because transcript/Claude summary was not generated (LLM failed: {summary.error_message or 'Unknown LLM error'})."
-            logger.warning("[Phase5Pipeline] E2E Pipeline partial failure at LLM stage for event '%s': %s", target_event_id, err_msg)
+            logger.error(
+                "========== TEKMEET PIPELINE FAILED ==========\n"
+                "Event ID: %s\n"
+                "Call ID: %s\n"
+                "Failed Stage: AI Summary\n"
+                "Reason: %s\n"
+                "=======================",
+                target_event_id,
+                target_call_id or "N/A",
+                err_msg,
+            )
             failed_delivery = DeliveryRecord(
                 delivery_id=f"del_{uuid.uuid4().hex[:12]}",
                 event_id=target_event_id,
@@ -276,7 +287,17 @@ class Phase5Pipeline:
 
         if not recipient or not self.mail_service.validate_email_address(recipient):
             err_msg = f"Invalid or missing organizer email address '{recipient}' for event '{target_event_id}'."
-            logger.error("[Phase5Pipeline] %s", err_msg)
+            logger.error(
+                "========== TEKMEET PIPELINE FAILED ==========\n"
+                "Event ID: %s\n"
+                "Call ID: %s\n"
+                "Failed Stage: Email Validation\n"
+                "Reason: %s\n"
+                "=======================",
+                target_event_id,
+                target_call_id or "N/A",
+                err_msg,
+            )
             failed_delivery = DeliveryRecord(
                 delivery_id=f"del_{uuid.uuid4().hex[:12]}",
                 event_id=target_event_id,
@@ -300,11 +321,6 @@ class Phase5Pipeline:
             )
 
         # Step 5: Email Delivery Stage
-        logger.info(
-            "[Email Delivery]\neventId=%s\ncallId=%s\ntranscriptId=%s\nsummaryId=%s",
-            target_event_id, target_call_id or "", transcript.transcript_id, summary.summary_id
-        )
-
         delivery_record = await self.mail_service.send_summary_email(
             event_id=target_event_id,
             recipient_email=recipient,
@@ -321,11 +337,30 @@ class Phase5Pipeline:
         overall_status = "completed" if delivery_record.status == DeliveryStatus.SENT else "partial"
         overall_error = None if delivery_record.status == DeliveryStatus.SENT else f"Email delivery failed: {delivery_record.error_message}"
 
+        email_status_str = "SENT" if delivery_record.status == DeliveryStatus.SENT else "FAILED"
+        rec_file_name = Path(target_recording_file).name
+
         logger.info(
-            "[Phase5Pipeline] Completed E2E Pipeline for event '%s' | Status: %s | Delivery: %s",
+            "========== TEKMEET PIPELINE COMPLETE ==========\n"
+            "Event ID: %s\n"
+            "Call ID: %s\n"
+            "Recording: %s\n"
+            "Recording Size: %d bytes\n"
+            "Transcript ID: %s\n"
+            "Summary ID: %s\n"
+            "Delivery ID: %s\n"
+            "Email Recipient: %s\n"
+            "Email Status: %s\n"
+            "=========================",
             target_event_id,
-            overall_status,
-            delivery_record.status,
+            target_call_id or "N/A",
+            rec_file_name,
+            file_size,
+            transcript.transcript_id if transcript else "N/A",
+            summary.summary_id if summary else "N/A",
+            delivery_record.delivery_id if delivery_record else "N/A",
+            recipient or "N/A",
+            email_status_str,
         )
 
         return Phase5PipelineResult(

@@ -241,20 +241,6 @@ class MeetingDispatcher:
                 concluded = False
                 if current_time > job.end_time:
                     concluded = True
-                elif self.settings.use_app_hosted_media:
-                    # Query MediaWorker status to detect early call disconnect
-                    try:
-                        async with httpx.AsyncClient(timeout=2.0) as client:
-                            resp = await client.get(f"{self.settings.media_worker_url}/api/media/status")
-                            if resp.status_code == 200:
-                                data = resp.json()
-                                is_recording = data.get("isRecording", False)
-                                elapsed = (current_time - job.dispatched_at).total_seconds() if job.dispatched_at else 0
-                                if not is_recording and elapsed > 20:
-                                    logger.info("[MeetingDispatcher] MediaWorker reports recording finished for job %s (elapsed: %.1fs). Marking COMPLETED.", job.event_id, elapsed)
-                                    concluded = True
-                    except Exception as exc:
-                        logger.debug("[MeetingDispatcher] MediaWorker status check exception for job %s: %s", job.event_id, exc)
 
                 if concluded:
                     # Meeting was triggered and has now concluded
@@ -355,7 +341,15 @@ class MeetingDispatcher:
             return None
 
         self._running_pipelines.add(job.event_id)
-        logger.info("[Meeting Ended] Automatically detected meeting end for '%s' (EventId: %s)", job.subject, job.event_id)
+        final_rec_path = file_path_or_name or f"meeting_{job.event_id}.wav"
+        logger.info(
+            "[DISPATCHER] Meeting termination detected\n"
+            "[DISPATCHER] Stopping MediaWorker recording\n"
+            "[DISPATCHER] Event ID: %s\n"
+            "[DISPATCHER] Call ID: %s",
+            job.event_id,
+            job.call_id or "N/A",
+        )
 
         try:
             # 1. Finalize recording on MediaWorker
@@ -364,9 +358,13 @@ class MeetingDispatcher:
                     stop_url = f"{self.settings.media_worker_url}/api/media/recording/stop"
                     async with httpx.AsyncClient(timeout=5.0) as client:
                         resp = await client.get(stop_url)
-                        logger.info("[Recording Finalized] MediaWorker recording finalization response for job %s: %s", job.event_id, resp.text)
+                        logger.info(
+                            "[DISPATCHER] Recording stop response received\n"
+                            "[DISPATCHER] Final recording path: %s",
+                            final_rec_path,
+                        )
                 except Exception as exc:
-                    logger.warning("[MeetingDispatcher] Could not trigger MediaWorker StopRecording for job %s: %s", job.event_id, exc)
+                    logger.error("[DISPATCHER] ERROR: Stopping MediaWorker recording failed - %s", exc)
 
             # 2. Check recording file readiness (bounded retry loop)
             await self.check_recording_readiness(

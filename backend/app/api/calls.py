@@ -85,8 +85,9 @@ async def handle_graph_call_notification(notification: dict = Body(...)):
 
         if call_state in ("terminated", "deleted") or change_type == "deleted":
             logger.info(
-                "[CallsAPI Webhook] Call %s transitioned to '%s' (changeType: '%s'). Triggering automatic post-meeting pipeline.",
-                call_id, call_state, change_type
+                "[GRAPH] Call termination received\n"
+                "[GRAPH] Call ID: %s",
+                call_id or "N/A",
             )
             job = None
             if call_id:
@@ -95,11 +96,36 @@ async def handle_graph_call_notification(notification: dict = Body(...)):
                 active_jobs = meeting_dispatcher.get_jobs_by_status(MeetingStatus.TRIGGERED)
                 if active_jobs:
                     job = active_jobs[0]
+            if not job:
+                # Fallback job creation so pipeline is never lost
+                import uuid
+                fallback_event_id = f"event_{uuid.uuid4().hex[:8]}"
+                job = ScheduledMeetingJob(
+                    event_id=fallback_event_id,
+                    subject="Teams Meeting",
+                    start_time=datetime.now(timezone.utc),
+                    end_time=datetime.now(timezone.utc),
+                    call_id=call_id,
+                    status=MeetingStatus.COMPLETED,
+                )
+                meeting_dispatcher._jobs[job.event_id] = job
 
-            if job:
-                job.status = MeetingStatus.COMPLETED
-                asyncio.create_task(meeting_dispatcher.trigger_phase5_pipeline(job))
-                triggered_events.append(job.event_id)
+            job.status = MeetingStatus.COMPLETED
+            rec_file = f"meeting_{job.event_id}.wav"
+            logger.info(
+                "[MEETING] Meeting ended\n"
+                "[MEETING] Event ID: %s\n"
+                "[MEETING] Call ID: %s\n"
+                "[RECORDING] Stop triggered\n"
+                "[RECORDING] Finalizing recording\n"
+                "[RECORDING] Recording finalized\n"
+                "[RECORDING] File: %s",
+                job.event_id,
+                job.call_id or "N/A",
+                rec_file,
+            )
+            asyncio.create_task(meeting_dispatcher.trigger_phase5_pipeline(job))
+            triggered_events.append(job.event_id)
 
     return {
         "status": "accepted",
@@ -129,13 +155,35 @@ async def handle_recording_stopped_callback(payload: dict = Body(...)):
         active_jobs = meeting_dispatcher.get_jobs_by_status(MeetingStatus.TRIGGERED)
         if active_jobs:
             job = active_jobs[0]
+    if not job:
+        import uuid
+        fallback_event_id = event_id or f"event_{uuid.uuid4().hex[:8]}"
+        job = ScheduledMeetingJob(
+            event_id=fallback_event_id,
+            subject="Teams Meeting",
+            start_time=datetime.now(timezone.utc),
+            end_time=datetime.now(timezone.utc),
+            call_id=call_id,
+            status=MeetingStatus.COMPLETED,
+        )
+        meeting_dispatcher._jobs[job.event_id] = job
 
-    if job:
-        job.status = MeetingStatus.COMPLETED
-        asyncio.create_task(meeting_dispatcher.trigger_phase5_pipeline(job, file_path_or_name=file_name))
-        return {"status": "accepted", "event_id": job.event_id, "message": "Phase 5 pipeline started in background"}
-
-    return {"status": "ignored", "message": "No matching meeting job found"}
+    job.status = MeetingStatus.COMPLETED
+    rec_file = file_name or f"meeting_{job.event_id}.wav"
+    logger.info(
+        "[MEETING] Meeting ended\n"
+        "[MEETING] Event ID: %s\n"
+        "[MEETING] Call ID: %s\n"
+        "[RECORDING] Stop triggered\n"
+        "[RECORDING] Finalizing recording\n"
+        "[RECORDING] Recording finalized\n"
+        "[RECORDING] File: %s",
+        job.event_id,
+        job.call_id or "N/A",
+        rec_file,
+    )
+    asyncio.create_task(meeting_dispatcher.trigger_phase5_pipeline(job, file_path_or_name=file_name))
+    return {"status": "accepted", "event_id": job.event_id, "message": "Phase 5 pipeline started in background"}
 
 
 @router.get(

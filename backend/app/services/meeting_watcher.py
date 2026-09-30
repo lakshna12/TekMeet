@@ -78,6 +78,35 @@ class MeetingWatcher:
                         logger.debug("Skipping already seen meeting: %s (%s)", event.subject, event.event_id)
                         continue
                     teams_meetings.append(event)
+                    start_str = event.start_time.isoformat() if event.start_time else "N/A"
+                    end_str = event.end_time.isoformat() if event.end_time else "N/A"
+                    now_str = now_utc.isoformat()
+                    buffer_delta = timedelta(seconds=self.settings.join_buffer_seconds)
+                    if event.start_time and event.end_time:
+                        if now_utc < (event.start_time - buffer_delta):
+                            m_status = "scheduled"
+                        elif (event.start_time - buffer_delta) <= now_utc <= event.end_time:
+                            m_status = "due"
+                        else:
+                            m_status = "already started"
+                    else:
+                        m_status = "scheduled"
+
+                    logger.info(
+                        "[CALENDAR] Teams meeting detected\n"
+                        "[CALENDAR] Event ID: %s\n"
+                        "[CALENDAR] Subject: %s\n"
+                        "[CALENDAR] Scheduled start: %s\n"
+                        "[CALENDAR] Scheduled end: %s\n"
+                        "[CALENDAR] Current time: %s\n"
+                        "[CALENDAR] Meeting status: %s",
+                        event.event_id,
+                        event.subject,
+                        start_str,
+                        end_str,
+                        now_str,
+                        m_status,
+                    )
 
             # Sort ascending by start_time
             teams_meetings.sort(key=lambda m: m.start_time or datetime.max.replace(tzinfo=timezone.utc))

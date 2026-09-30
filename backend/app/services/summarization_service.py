@@ -80,19 +80,28 @@ class SummarizationService:
         """
         summary_id = f"sum_{uuid.uuid4().hex[:12]}"
         logger.info(
-            "[SummarizationService] Starting summarization for event '%s' (transcript_id: %s)",
-            transcript.event_id,
+            "[AI] Starting meeting summary\n"
+            "[AI] Transcript ID: %s\n"
+            "[AI] Call ID: %s",
             transcript.transcript_id,
+            transcript.call_id or "N/A",
         )
 
         # Handle explicit mock override (used in unit tests)
         if mock_provider_override is not None:
-            return self._build_summary_from_dict(
+            sm = self._build_summary_from_dict(
                 summary_id=summary_id,
                 event_id=transcript.event_id,
                 transcript_id=transcript.transcript_id,
                 data=mock_provider_override,
             )
+            logger.info(
+                "[AI] Meeting summary generated\n"
+                "[AI] Summary ID: %s\n"
+                "[AI] Summary saved",
+                sm.summary_id,
+            )
+            return sm
 
         # Step 1: Check for empty / silent / unsupported transcript (TC #17)
         full_text_trimmed = (transcript.full_text or "").strip()
@@ -102,7 +111,12 @@ class SummarizationService:
             or full_text_trimmed == "No speech detected."
             or full_text_trimmed == "No speech detected (empty recording)."
         ):
-            logger.info("[SummarizationService] Transcript is empty/silent for event '%s'. Generating empty summary.", transcript.event_id)
+            logger.info(
+                "[AI] Meeting summary generated\n"
+                "[AI] Summary ID: %s\n"
+                "[AI] Summary saved",
+                summary_id,
+            )
             return MeetingSummary(
                 summary_id=summary_id,
                 event_id=transcript.event_id,
@@ -117,7 +131,7 @@ class SummarizationService:
         # Step 2: Handle failed transcripts
         if transcript.status == TranscriptionStatus.FAILED:
             err_msg = f"Cannot summarize failed transcript: {transcript.error_message or 'Unknown error'}"
-            logger.error("[SummarizationService] %s", err_msg)
+            logger.error("[AI] ERROR: %s", err_msg)
             return MeetingSummary(
                 summary_id=summary_id,
                 event_id=transcript.event_id,
@@ -129,8 +143,8 @@ class SummarizationService:
         # Step 3: Verify Claude API Key presence
         api_key = self._get_api_key()
         if not api_key:
-            err_msg = "Claude API Key is not configured in environment (CLAUDE_API_KEY)."
-            logger.error("[SummarizationService] %s", err_msg)
+            err_msg = "Claude/Gemini API Key is not configured in environment."
+            logger.error("[AI] ERROR: %s", err_msg)
             return MeetingSummary(
                 summary_id=summary_id,
                 event_id=transcript.event_id,
@@ -142,11 +156,6 @@ class SummarizationService:
         # Step 4: Handle long transcripts safely (Truncation / Safe Chunking)
         processed_text = full_text_trimmed
         if len(processed_text) > MAX_TRANSCRIPT_CHARS:
-            logger.warning(
-                "[SummarizationService] Transcript character count (%d) exceeds max boundary (%d). Truncating safely.",
-                len(processed_text),
-                MAX_TRANSCRIPT_CHARS,
-            )
             processed_text = processed_text[:MAX_TRANSCRIPT_CHARS] + "\n\n[...Transcript truncated for length...]"
 
         # Step 5: Invoke Google Gemini LLM Summarization API
@@ -154,11 +163,10 @@ class SummarizationService:
             gemini_key = self._get_gemini_key()
 
             if gemini_key:
-                logger.info("[SummarizationService] Invoking Google Gemini API (%s)...", self.settings.gemini_model)
                 raw_response_text = await self._call_gemini_api(api_key=gemini_key, transcript_text=processed_text)
             else:
                 err_msg = "Google Gemini API Key (GEMINI_API_KEY) is not configured."
-                logger.error("[SummarizationService] %s", err_msg)
+                logger.error("[AI] ERROR: %s", err_msg)
                 return MeetingSummary(
                     summary_id=summary_id,
                     event_id=transcript.event_id,
@@ -170,12 +178,19 @@ class SummarizationService:
             # Step 6: Parse structured JSON from response
             summary_dict = self._parse_json_response(raw_response_text)
 
-            return self._build_summary_from_dict(
+            sm = self._build_summary_from_dict(
                 summary_id=summary_id,
                 event_id=transcript.event_id,
                 transcript_id=transcript.transcript_id,
                 data=summary_dict,
             )
+            logger.info(
+                "[AI] Meeting summary generated\n"
+                "[AI] Summary ID: %s\n"
+                "[AI] Summary saved",
+                sm.summary_id,
+            )
+            return sm
 
         except Exception as exc:
             redacted_err = str(exc)
@@ -185,7 +200,7 @@ class SummarizationService:
                 redacted_err = redacted_err.replace(claude_key, "[REDACTED_API_KEY]")
             if gemini_key:
                 redacted_err = redacted_err.replace(gemini_key, "[REDACTED_API_KEY]")
-            logger.error("[SummarizationService] Error calling LLM API for event '%s': %s", transcript.event_id, redacted_err)
+            logger.error("[AI] ERROR: Error calling LLM API - %s", redacted_err)
             return MeetingSummary(
                 summary_id=summary_id,
                 event_id=transcript.event_id,

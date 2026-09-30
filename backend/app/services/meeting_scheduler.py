@@ -6,7 +6,7 @@ and coordinates with the MeetingDispatcher to trigger join actions at meeting st
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from app.core.config import Settings, settings
@@ -106,10 +106,28 @@ class MeetingSchedulerService:
                 meetings=watch_resp.meetings,
                 now_utc=current_time,
             )
+            for j in updated_jobs:
+                if j.event_id not in existing_job_ids:
+                    trigger_dt = j.start_time - timedelta(seconds=self.settings.join_buffer_seconds)
+                    logger.info(
+                        "[SCHEDULER] Meeting scheduled\n"
+                        "[SCHEDULER] Event ID: %s\n"
+                        "[SCHEDULER] Scheduled start: %s\n"
+                        "[SCHEDULER] Scheduled end: %s\n"
+                        "[SCHEDULER] Join trigger time: %s",
+                        j.event_id,
+                        j.start_time.isoformat(),
+                        j.end_time.isoformat(),
+                        trigger_dt.isoformat(),
+                    )
             newly_scheduled = sum(1 for j in updated_jobs if j.event_id not in existing_job_ids)
 
             # 3. Evaluate due meetings
             dispatched = await self.dispatcher.evaluate_and_dispatch_due_meetings(now_utc=current_time)
+            for j in dispatched:
+                logger.info(
+                    "[SCHEDULER] Starting automatic join\n[SCHEDULER] Event ID: %s", j.event_id
+                )
             dispatched_ids = [j.event_id for j in dispatched]
 
             summary_msg = (

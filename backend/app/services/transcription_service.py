@@ -77,22 +77,39 @@ class TranscriptionService:
             Structured Transcript model (Status COMPLETED, EMPTY, FAILED, or UNSUPPORTED).
         """
         transcript_id = f"tr_{uuid.uuid4().hex[:12]}"
-        logger.info("[TranscriptionService] Initiating Deepgram transcription for event '%s' (file: %s)", event_id, file_path_or_name)
+        # Step 1: Validate or retrieve audio bytes/path
+        local_file_path, audio_bytes, file_name, err_status = await self._resolve_audio_source(file_path_or_name, file_bytes)
+        file_sz = len(audio_bytes) if audio_bytes else 0
+        logger.info(
+            "[DEEPGRAM] Starting transcription\n"
+            "[DEEPGRAM] Recording: %s\n"
+            "[DEEPGRAM] File size: %d\n"
+            "[DEEPGRAM] Duration: 0.0s",
+            file_name,
+            file_sz,
+        )
 
         # Handle explicit mock override (used in unit tests)
         if mock_provider_override is not None:
-            return self._build_transcript_from_dict(
+            tr = self._build_transcript_from_dict(
                 transcript_id=transcript_id,
                 event_id=event_id,
                 call_id=call_id,
                 file_name=file_path_or_name,
                 data=mock_provider_override,
             )
+            logger.info(
+                "[DEEPGRAM] Transcription completed\n"
+                "[DEEPGRAM] Transcript length: %d chars\n"
+                "[DEEPGRAM] Transcript saved\n"
+                "[DEEPGRAM] Transcript ID: %s",
+                len(tr.full_text or ""),
+                tr.transcript_id,
+            )
+            return tr
 
-        # Step 1: Validate or retrieve audio bytes/path
-        local_file_path, audio_bytes, file_name, err_status = await self._resolve_audio_source(file_path_or_name, file_bytes)
         if err_status:
-            logger.error("[TranscriptionService] Audio source resolution failed for '%s': %s", file_path_or_name, err_status[1])
+            logger.error("[DEEPGRAM] ERROR: Audio source resolution failed - %s", err_status[1])
             return Transcript(
                 transcript_id=transcript_id,
                 event_id=event_id,
@@ -106,7 +123,7 @@ class TranscriptionService:
         # Step 2: Validate file format (.wav, .mp4, .m4a, .mp3, .webm supported)
         ext = Path(file_name).suffix.lower()
         if ext not in [".wav", ".mp4", ".m4a", ".mp3", ".webm", ".ogg", ".flac"]:
-            logger.warning("[TranscriptionService] File format '%s' is unsupported.", ext)
+            logger.error("[DEEPGRAM] ERROR: File format '%s' is unsupported", ext)
             return Transcript(
                 transcript_id=transcript_id,
                 event_id=event_id,
@@ -119,7 +136,13 @@ class TranscriptionService:
 
         # Step 3: Check for empty or zero-byte file
         if len(audio_bytes) < 100:  # Header-only or empty file
-            logger.info("[TranscriptionService] Audio file '%s' is empty or zero-byte (%d bytes).", file_name, len(audio_bytes))
+            logger.info(
+                "[DEEPGRAM] Transcription completed\n"
+                "[DEEPGRAM] Transcript length: 0 chars\n"
+                "[DEEPGRAM] Transcript saved\n"
+                "[DEEPGRAM] Transcript ID: %s",
+                transcript_id,
+            )
             return Transcript(
                 transcript_id=transcript_id,
                 event_id=event_id,
@@ -133,7 +156,7 @@ class TranscriptionService:
         api_key = self._get_api_key()
         if not api_key:
             err_msg = "Deepgram API Key is not configured in environment (DEEPGRAM_API_KEY)."
-            logger.error("[TranscriptionService] %s", err_msg)
+            logger.error("[DEEPGRAM] ERROR: %s", err_msg)
             return Transcript(
                 transcript_id=transcript_id,
                 event_id=event_id,
@@ -147,8 +170,6 @@ class TranscriptionService:
         # Step 5: Send file to Deepgram REST API
         try:
             model_name = self.settings.deepgram_model
-            logger.info("[TranscriptionService] Sending audio to Deepgram API (model: %s)...", model_name)
-            
             url = f"https://api.deepgram.com/v1/listen?punctuate=true&utterances=true&smart_format=true&model={model_name}"
             headers = {
                 "Authorization": f"Token {api_key}",
@@ -160,7 +181,7 @@ class TranscriptionService:
 
             if response.status_code != 200:
                 safe_err_text = response.text.replace(api_key, "[REDACTED_API_KEY]")
-                logger.error("[TranscriptionService] Deepgram API returned status %d: %s", response.status_code, safe_err_text)
+                logger.error("[DEEPGRAM] ERROR: Deepgram API HTTP %d: %s", response.status_code, safe_err_text)
                 return Transcript(
                     transcript_id=transcript_id,
                     event_id=event_id,
@@ -172,17 +193,26 @@ class TranscriptionService:
                 )
 
             res_data = response.json()
-            return self._parse_deepgram_response(
+            tr = self._parse_deepgram_response(
                 transcript_id=transcript_id,
                 event_id=event_id,
                 call_id=call_id,
                 file_name=file_name,
                 data=res_data,
             )
+            logger.info(
+                "[DEEPGRAM] Transcription completed\n"
+                "[DEEPGRAM] Transcript length: %d chars\n"
+                "[DEEPGRAM] Transcript saved\n"
+                "[DEEPGRAM] Transcript ID: %s",
+                len(tr.full_text or ""),
+                tr.transcript_id,
+            )
+            return tr
 
         except Exception as exc:
             safe_exc = str(exc).replace(api_key, "[REDACTED_API_KEY]") if api_key else str(exc)
-            logger.error("[TranscriptionService] Exception during Deepgram API call: %s", safe_exc)
+            logger.error("[DEEPGRAM] ERROR: Exception during transcription - %s", safe_exc)
             return Transcript(
                 transcript_id=transcript_id,
                 event_id=event_id,

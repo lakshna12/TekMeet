@@ -218,19 +218,32 @@ class EmailService:
         """
         delivery_id = f"del_{uuid.uuid4().hex[:12]}"
         target_provider = provider_override or self._get_configured_provider()
+        subject = f"Meeting Summary: {meeting_title}"
+        summary_id = getattr(summary, "summary_id", "N/A") if summary else "N/A"
 
         logger.info(
-            "[EmailService] Initiating email delivery preparation (ID: %s) for event '%s' via provider '%s' to recipient '%s'",
-            delivery_id,
+            "[EMAIL] Preparing meeting summary email\n"
+            "[EMAIL] Event ID: %s\n"
+            "[EMAIL] Call ID: %s\n"
+            "[EMAIL] Summary ID: %s\n"
+            "[EMAIL] Recipient: %s\n"
+            "[EMAIL] Subject: %s",
             event_id,
-            target_provider.value if hasattr(target_provider, "value") else target_provider,
-            recipient_email,
+            "N/A",
+            summary_id,
+            recipient_email or "N/A",
+            subject,
         )
 
         # Recipient address validation (TC #19)
         if not self.validate_email_address(recipient_email):
             err_msg = f"Invalid or missing recipient email address '{recipient_email}'."
-            logger.error("[EmailService] [Validation] %s", err_msg)
+            logger.error(
+                "[EMAIL] ERROR: Mail.Send failed - %s\n"
+                "[DELIVERY] FAILED: %s",
+                err_msg,
+                err_msg,
+            )
             return DeliveryRecord(
                 delivery_id=delivery_id,
                 event_id=event_id,
@@ -243,7 +256,12 @@ class EmailService:
         # Summary availability validation
         if not summary or getattr(summary, "status", None) == "failed":
             err_msg = "Meeting summary unavailable because transcript/Claude summary was not generated."
-            logger.error("[EmailService] [Validation] %s", err_msg)
+            logger.error(
+                "[EMAIL] ERROR: Mail.Send failed - %s\n"
+                "[DELIVERY] FAILED: %s",
+                err_msg,
+                err_msg,
+            )
             return DeliveryRecord(
                 delivery_id=delivery_id,
                 event_id=event_id,
@@ -252,9 +270,6 @@ class EmailService:
                 status=DeliveryStatus.FAILED,
                 error_message=err_msg,
             )
-
-        subject = f"Meeting Summary: {meeting_title}"
-        logger.info("[EmailService] Email preparation started: Subject='%s', Recipient='%s'", subject, recipient_email.strip())
 
         body_html = self.render_summary_email_html(summary, meeting_title, recording_url, transcript_url)
         body_text = f"Meeting Summary: {meeting_title}\n\nOverview:\n{summary.overview}\n\nKey Points:\n" + "\n".join(f"- {kp}" for kp in summary.key_points)
@@ -270,11 +285,19 @@ class EmailService:
         # Retry loop for transient provider errors
         last_error = ""
         for attempt in range(1, max_retries + 1):
-            logger.info("[EmailService] Send attempt %d/%d starting via %s to '%s'", attempt, max_retries, target_provider, recipient_email.strip())
             try:
                 if target_provider == DeliveryProvider.MOCK:
                     self.mock_sent_emails.append(payload)
-                    logger.info("[EmailService] [MOCK] Successfully delivered email to '%s'", recipient_email)
+                    logger.info(
+                        "[EMAIL] Email sent successfully\n"
+                        "[EMAIL] Recipient: %s\n"
+                        "[EMAIL] Subject: %s\n"
+                        "[DELIVERY] Delivery completed\n"
+                        "[DELIVERY] Delivery ID: %s",
+                        recipient_email.strip(),
+                        subject,
+                        delivery_id,
+                    )
                     return DeliveryRecord(
                         delivery_id=delivery_id,
                         event_id=event_id,
@@ -286,8 +309,21 @@ class EmailService:
                     )
 
                 elif target_provider == DeliveryProvider.GRAPH:
+                    logger.info(
+                        "[EMAIL] Sending email through Microsoft Graph\n"
+                        "[EMAIL] Mail.Send request started"
+                    )
                     await self._send_via_graph_api(payload)
-                    logger.info("[EmailService] [GRAPH] Successfully delivered email to '%s'", recipient_email)
+                    logger.info(
+                        "[EMAIL] Email sent successfully\n"
+                        "[EMAIL] Recipient: %s\n"
+                        "[EMAIL] Subject: %s\n"
+                        "[DELIVERY] Delivery completed\n"
+                        "[DELIVERY] Delivery ID: %s",
+                        recipient_email.strip(),
+                        subject,
+                        delivery_id,
+                    )
                     return DeliveryRecord(
                         delivery_id=delivery_id,
                         event_id=event_id,
@@ -300,7 +336,16 @@ class EmailService:
 
                 elif target_provider == DeliveryProvider.SMTP:
                     self._send_via_smtp(payload)
-                    logger.info("[EmailService] [SMTP] Successfully delivered email to '%s'", recipient_email)
+                    logger.info(
+                        "[EMAIL] Email sent successfully\n"
+                        "[EMAIL] Recipient: %s\n"
+                        "[EMAIL] Subject: %s\n"
+                        "[DELIVERY] Delivery completed\n"
+                        "[DELIVERY] Delivery ID: %s",
+                        recipient_email.strip(),
+                        subject,
+                        delivery_id,
+                    )
                     return DeliveryRecord(
                         delivery_id=delivery_id,
                         event_id=event_id,
@@ -313,10 +358,20 @@ class EmailService:
 
             except Exception as exc:
                 last_error = str(exc)
-                logger.warning("[EmailService] Send attempt %d/%d failed via %s: %s", attempt, max_retries, target_provider, exc)
+                logger.warning(
+                    "[EMAIL] ERROR: Mail.Send failed - %s\n"
+                    "[DELIVERY] FAILED: %s",
+                    last_error,
+                    last_error,
+                )
 
         err_msg = f"Delivery failed after {max_retries} attempts. Last error: {last_error}"
-        logger.error("[EmailService] %s", err_msg)
+        logger.error(
+            "[EMAIL] ERROR: Mail.Send failed - %s\n"
+            "[DELIVERY] FAILED: %s",
+            err_msg,
+            err_msg,
+        )
         return DeliveryRecord(
             delivery_id=delivery_id,
             event_id=event_id,
