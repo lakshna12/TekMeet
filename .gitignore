@@ -43,3 +43,5 @@ bin/
 obj/
 media_worker/ffmpeg.exe
 *.exe
+
+backend/tekmeet.db
