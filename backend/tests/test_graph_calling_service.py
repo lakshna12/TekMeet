@@ -265,3 +265,31 @@ async def test_audiosocket_per_call_lifecycle_and_blob_uniqueness(mock_settings,
     assert blob2 == "blob_call_2_uuid_bbb"
     assert blob1 != blob2
 
+
+@pytest.mark.asyncio
+async def test_get_call_state_connected(mock_settings, mock_auth):
+    """Test get_call_state returns ESTABLISHED when Graph API reports connected/established state."""
+    service = GraphCallingService(auth_service=mock_auth, app_settings=mock_settings)
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {"id": "call-123", "state": "established"}
+
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock, return_value=mock_resp):
+        state = await service.get_call_state("call-123")
+
+    assert state == CallState.ESTABLISHED
+
+
+@pytest.mark.asyncio
+async def test_get_call_state_terminated_when_404(mock_settings, mock_auth):
+    """Test get_call_state returns TERMINATED when Graph API returns 404 Not Found."""
+    service = GraphCallingService(auth_service=mock_auth, app_settings=mock_settings)
+    mock_resp = MagicMock()
+    mock_resp.status_code = 404
+
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock, return_value=mock_resp):
+        state = await service.get_call_state("call-123")
+
+    assert state == CallState.TERMINATED
+
+

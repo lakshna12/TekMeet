@@ -4,9 +4,11 @@ Converts recorded meeting audio (.wav / .mp4 / .mp3 / .webm) into structured Tra
 timestamped segments. Handles missing, empty, silent, corrupt, and unsupported files gracefully.
 """
 
+import io
 import logging
 import os
 import uuid
+import wave
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -56,6 +58,21 @@ class TranscriptionService:
         }
         return mime_map.get(ext, "application/octet-stream")
 
+    @staticmethod
+    def _extract_wav_duration(data: Optional[bytes]) -> float:
+        """Calculate duration in seconds directly from the WAV header and frame count."""
+        if not data or len(data) < 44:
+            return 0.0
+        try:
+            with wave.open(io.BytesIO(data), "rb") as w:
+                frames = w.getnframes()
+                rate = w.getframerate()
+                if rate > 0 and frames > 0:
+                    return round(frames / float(rate), 2)
+        except Exception:
+            pass
+        return 0.0
+
     async def transcribe_recording(
         self,
         event_id: str,
@@ -80,13 +97,15 @@ class TranscriptionService:
         # Step 1: Validate or retrieve audio bytes/path
         local_file_path, audio_bytes, file_name, err_status = await self._resolve_audio_source(file_path_or_name, file_bytes)
         file_sz = len(audio_bytes) if audio_bytes else 0
+        dur = self._extract_wav_duration(audio_bytes)
         logger.info(
             "[DEEPGRAM] Starting transcription\n"
             "[DEEPGRAM] Recording: %s\n"
             "[DEEPGRAM] File size: %d\n"
-            "[DEEPGRAM] Duration: 0.0s",
+            "[DEEPGRAM] Duration: %.1fs",
             file_name,
             file_sz,
+            dur,
         )
 
         # Handle explicit mock override (used in unit tests)

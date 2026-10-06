@@ -10,10 +10,12 @@ and graceful degradation so delivery failures never delete completed transcripts
 """
 
 import hashlib
+import io
 import httpx
 import logging
 import re
 import uuid
+import wave
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -81,20 +83,42 @@ class Phase5Pipeline:
             return self.settings.azure_bot_user_email.strip()
         return None
 
+    @staticmethod
+    def _extract_wav_duration(data: Optional[bytes]) -> float:
+        """Calculate duration in seconds directly from the WAV header and frame count."""
+        if not data or len(data) < 44:
+            return 0.0
+        try:
+            with wave.open(io.BytesIO(data), "rb") as w:
+                frames = w.getnframes()
+                rate = w.getframerate()
+                if rate > 0 and frames > 0:
+                    return round(frames / float(rate), 2)
+        except Exception:
+            pass
+        return 0.0
+
     def _compute_sha256_and_meta(self, file_path_or_name: str, file_bytes: Optional[bytes]) -> tuple[str, int, float]:
-        """Calculate SHA256 checksum, file size, and duration if available."""
+        """Calculate SHA256 checksum, file size, and duration from WAV header/frames."""
         if file_bytes:
             sha256 = hashlib.sha256(file_bytes).hexdigest()
             size = len(file_bytes)
-            return sha256, size, 0.0
+            duration = self._extract_wav_duration(file_bytes)
+            return sha256, size, duration
 
         p = Path(file_path_or_name)
+        if not p.exists() and not p.is_absolute():
+            candidate = Path("recordings") / p.name
+            if candidate.exists() and candidate.is_file():
+                p = candidate
+
         if p.exists() and p.is_file():
             try:
                 data = p.read_bytes()
                 sha256 = hashlib.sha256(data).hexdigest()
                 size = len(data)
-                return sha256, size, 0.0
+                duration = self._extract_wav_duration(data)
+                return sha256, size, duration
             except Exception:
                 pass
 
@@ -111,7 +135,8 @@ class Phase5Pipeline:
                         local_save_dir = Path("recordings")
                         local_save_dir.mkdir(parents=True, exist_ok=True)
                         (local_save_dir / fname).write_bytes(data)
-                        return sha256, size, 0.0
+                        duration = self._extract_wav_duration(data)
+                        return sha256, size, duration
             except Exception:
                 pass
 

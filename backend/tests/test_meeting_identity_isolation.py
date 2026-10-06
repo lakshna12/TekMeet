@@ -145,6 +145,7 @@ async def test_duplicate_callback_and_re_execution_protection(temp_storage_dir: 
         event_id=event_id,
         call_id=call_id,
         file_path_or_name=rec_file,
+        mock_stt_override=mock_stt,
         mock_email_provider=DeliveryProvider.MOCK,
     )
 

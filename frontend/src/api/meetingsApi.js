@@ -46,6 +46,22 @@ export const scheduleMeeting = async (payload) => {
   }
 };
 
+// 3. Live Bot Join & Calls APIs (Media Worker Integration)
+export const joinMeeting = async (payload) => {
+  const res = await axiosClient.post('/api/v1/calls/join', payload);
+  return res.data;
+};
+
+export const getCallRecords = async () => {
+  const res = await axiosClient.get('/api/v1/calls');
+  return res.data;
+};
+
+export const getCallRecord = async (callId) => {
+  const res = await axiosClient.get(`/api/v1/calls/${callId}`);
+  return res.data;
+};
+
 // 3. Scheduler & Job Diagnostics APIs
 export const getSchedulerStatus = async () => {
   const res = await axiosClient.get('/api/v1/scheduler/status');
@@ -95,6 +111,9 @@ export const meetingsApi = {
   getPastMeetings,
   getMeetingSummaryView,
   scheduleMeeting,
+  joinMeeting,
+  getCallRecords,
+  getCallRecord,
   getSchedulerStatus,
   getScheduledJobs,
   triggerPollNow,

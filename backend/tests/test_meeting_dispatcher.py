@@ -241,8 +241,8 @@ async def test_trigger_phase5_pipeline_media_worker_stop(mock_settings, monkeypa
     res = await dispatcher.trigger_phase5_pipeline(job)
     assert res is not None
     assert res.status == "completed"
-    mock_get.assert_called_once_with("http://localhost:5050/api/media/recording/stop")
-    mock_pipeline.process_end_to_end_job.assert_called_once_with(job=job, force_refresh=False)
+    mock_get.assert_any_call("http://localhost:5050/api/media/recording/stop")
+    mock_pipeline.process_end_to_end_job.assert_called_once_with(job=job, file_path_or_name="meeting_evt_mw_stop.wav", force_refresh=False)
 
 
 @pytest.mark.asyncio
@@ -340,6 +340,7 @@ async def test_media_worker_stop_failure_does_not_crash_meeting_completion(mock_
     monkeypatch.setattr("httpx.AsyncClient.get", mock_get)
 
     dispatcher = MeetingDispatcher(pipeline=mock_pipeline, app_settings=mock_settings)
+    monkeypatch.setattr(dispatcher, "check_recording_readiness", AsyncMock(return_value=True))
 
     from app.models.scheduler import ScheduledMeetingJob
     now = datetime.now(timezone.utc)
