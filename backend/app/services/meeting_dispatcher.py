@@ -469,12 +469,16 @@ class MeetingDispatcher:
                                     files = list_resp.json()
                                     safe_eid = re.sub(r'[^a-zA-Z0-9_-]', '_', job.event_id)[:20] if job.event_id else ""
                                     safe_cid = re.sub(r'[^a-zA-Z0-9_-]', '_', job.call_id)[:12] if job.call_id else ""
-                                    for f in sorted(files, key=lambda x: x.get("createdAt", ""), reverse=True):
+                                    candidate_files = []
+                                    for f in files:
                                         fname = f.get("name", "")
                                         if fname.endswith(".wav") and f.get("sizeBytes", 0) > 100:
                                             if (safe_cid and safe_cid in fname) or (safe_eid and safe_eid in fname):
-                                                final_rec_path = fname
-                                                break
+                                                candidate_files.append(f)
+                                    if candidate_files:
+                                        # Always pick the largest recorded audio session for this meeting
+                                        largest_file = max(candidate_files, key=lambda x: x.get("sizeBytes", 0))
+                                        final_rec_path = largest_file.get("name", "")
                             except Exception:
                                 pass
 
