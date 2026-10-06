@@ -172,6 +172,17 @@ namespace MediaWorker.Services
             return CreateSockets().videoSocket;
         }
 
+        public static string GetCanonicalRecordingsDirectory()
+        {
+            string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+            string recordingsDir = Path.Combine(baseDir, "recordings");
+            if (!Directory.Exists(recordingsDir))
+            {
+                try { Directory.CreateDirectory(recordingsDir); } catch { }
+            }
+            return recordingsDir;
+        }
+
         public string StartRecording(string recordingDirectory, string eventId, string callId)
         {
             lock (_syncLock)
@@ -217,18 +228,9 @@ namespace MediaWorker.Services
                 var safeCallId = System.Text.RegularExpressions.Regex.Replace(_currentCallId ?? "call", @"[^a-zA-Z0-9_-]", "_");
                 if (safeCallId.Length > 12) safeCallId = safeCallId.Substring(0, 12);
 
-                var fullDirectory = Path.IsPathRooted(recordingDirectory)
-                    ? recordingDirectory
-                    : Path.Combine(AppDomain.CurrentDomain.BaseDirectory, recordingDirectory);
-
-                if (!Directory.Exists(fullDirectory))
-                {
-                    Directory.CreateDirectory(fullDirectory);
-                    _logger.LogInformation("[Recording] Created recording directory: {Directory}", fullDirectory);
-                }
+                var fullDirectory = GetCanonicalRecordingsDirectory();
 
                 var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
-                _logger.LogInformation("[MEDIA] Recording start requested\n[MEDIA] Event ID: {EventId}\n[MEDIA] Call ID: {CallId}", eventId, _currentCallId);
 
                 var wavFileName = $"meeting_{safeEventId}_{safeCallId}_{timestamp}.wav";
                 var nv12FileName = $"meeting_{safeEventId}_{safeCallId}_{timestamp}.nv12";
@@ -273,12 +275,18 @@ namespace MediaWorker.Services
                 WriteWavHeader(_recordingBinaryWriter, sampleRate: _detectedSampleRate, channels: _detectedChannels, bitsPerSample: _detectedBitsPerSample, pcmDataLength: 0);
 
                 _isRecording = true;
+
+                bool existsInitial = File.Exists(_currentFilePath);
+                long initialSize = existsInitial ? new FileInfo(_currentFilePath).Length : 0;
                 _logger.LogInformation(
-                    "[MEDIA] Recording started\n" +
-                    "[MEDIA] Recording file: {File}\n" +
-                    "[MEDIA] Recording start time: {StartTime:u}",
+                    "[MEDIA] Recording START\n" +
+                    "[MEDIA] Exact physical recording path: {Path}\n" +
+                    "[MEDIA] Recording directory: {Dir}\n" +
+                    "[MEDIA] File exists immediately after start: {Exists} ({Size} bytes)",
                     _currentFilePath,
-                    _recordingStartTime);
+                    fullDirectory,
+                    existsInitial,
+                    initialSize);
                 return _currentFilePath;
             }
         }
@@ -312,7 +320,7 @@ namespace MediaWorker.Services
             string? finalizedMp4FilePath = _currentMp4FilePath;
             long bytesWritten = _pcmDataBytesWritten;
 
-            _logger.LogInformation("[MEDIA] Recording stop requested\n[MEDIA] Finalizing WAV");
+            _logger.LogInformation("[MEDIA] Stop requested\n[MEDIA] AudioSocket stopped");
             try
             {
                 // Finalize WAV Header with exact detected sample rate, channel count, and bytes written
@@ -329,6 +337,7 @@ namespace MediaWorker.Services
                     _videoBinaryWriter.Flush();
                     _videoFileStream.Flush();
                 }
+                _logger.LogInformation("[MEDIA] WAV stream flushed");
             }
             catch (Exception ex)
             {
@@ -350,28 +359,47 @@ namespace MediaWorker.Services
                 _recordingFileStream = null;
                 _videoBinaryWriter = null;
                 _videoFileStream = null;
+                _logger.LogInformation("[MEDIA] WAV stream closed");
 
                 // Run Audio Validation & Diagnostic Summary
                 PerformAudioValidationReport();
 
-                long finalWavSize = 0;
-                if (!string.IsNullOrEmpty(finalizedFilePath) && File.Exists(finalizedFilePath))
-                {
-                    finalWavSize = new FileInfo(finalizedFilePath).Length;
-                }
+                bool existsAfterClose = !string.IsNullOrEmpty(finalizedFilePath) && File.Exists(finalizedFilePath);
+                long finalWavSize = existsAfterClose ? new FileInfo(finalizedFilePath!).Length : 0;
                 double finalDurationSec = (_recordingStopTime.Value - (_recordingStartTime ?? DateTime.UtcNow)).TotalSeconds;
+
                 _logger.LogInformation(
-                    "[MEDIA] PCM bytes written: {Bytes}\n" +
-                    "[MEDIA] Final file size: {Size}\n" +
-                    "[MEDIA] Duration: {Duration:F2}s\n" +
-                    "[MEDIA] WAV finalized successfully\n" +
-                    "[MEDIA] Recording file: {File}",
-                    bytesWritten, finalWavSize, finalDurationSec, finalizedFilePath);
+                    "[MEDIA] Exact physical file path after close: {Path}\n" +
+                    "[MEDIA] File.Exists(...): {Exists}\n" +
+                    "[MEDIA] File size: {Size} bytes\n" +
+                    "[MEDIA] AudioSocket buffers received: {Buffers}\n" +
+                    "[MEDIA] PCM bytes written: {PCMBytes}\n" +
+                    "[MEDIA] Non-zero samples: {NonZero}\n" +
+                    "[MEDIA] Peak amplitude: {Peak}\n" +
+                    "[MEDIA] Final WAV size: {Size} bytes",
+                    finalizedFilePath,
+                    existsAfterClose,
+                    finalWavSize,
+                    _callbackCount,
+                    bytesWritten,
+                    _nonZeroSampleCount,
+                    _peakAmplitude,
+                    finalWavSize);
+
+                if (existsAfterClose && finalWavSize > 0)
+                {
+                    _logger.LogInformation("[MEDIA] WAV finalized successfully");
+                }
+                else
+                {
+                    _logger.LogError("[MEDIA] ERROR: Physical file missing or 0 bytes after close (Exists={Exists}, Size={Size})", existsAfterClose, finalWavSize);
+                }
 
                 if (bytesWritten == 0 || (_nonZeroSampleCount == 0 && _callbackCount > 0))
                 {
                     _logger.LogWarning("[MEDIA] WARNING: Recording contains no meaningful audio data");
                 }
+
 
                 // Trigger FFmpeg MP4 Muxing
                 if (_videoCallbackCount > 0 && _lastVideoWidth > 0 && _lastVideoHeight > 0 &&

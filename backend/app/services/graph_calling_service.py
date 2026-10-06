@@ -287,6 +287,8 @@ class GraphCallingService:
                     data = resp.json()
                     blob = data.get("blob")
                     if blob:
+                        if isinstance(blob, (dict, list)):
+                            blob = json.dumps(blob)
                         logger.info("[GraphCallingService] Obtained appHostedMediaConfig blob from Media Worker.")
                         return blob
         except Exception as exc:
@@ -316,6 +318,56 @@ class GraphCallingService:
             logger.error("[GraphCallingService] Exception updating recording status for call %s: %s", call_id, exc)
         return False
 
+    async def get_call_state(self, call_id: str) -> CallState:
+        """Query Graph GET /communications/calls/{call_id} to get real-time call state.
+
+        Returns CallState.TERMINATED if the call is in 'terminated'/'terminating' state or if Graph returns HTTP 404 (deleted).
+        """
+        if not call_id:
+            return CallState.TERMINATED
+
+        endpoint = f"{self.settings.microsoft_graph_base_url}/communications/calls/{call_id}"
+        try:
+            headers = self._get_headers()
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(endpoint, headers=headers)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    state_str = (data.get("state") or "").lower()
+                    result_info = data.get("resultInfo")
+                    
+                    if result_info:
+                        logger.info(
+                            "[GRAPH] Call %s state details | State: %s | ResultCode: %s | Subcode: %s | Message: %s",
+                            call_id,
+                            state_str.upper(),
+                            result_info.get("code"),
+                            result_info.get("subcode"),
+                            result_info.get("message"),
+                        )
+
+                    if state_str in ("terminated", "terminating"):
+                        logger.info("[GRAPH] Call state transition | Call ID: %s | State: TERMINATED (from '%s')", call_id, state_str)
+                        return CallState.TERMINATED
+                    elif state_str == "established":
+                        logger.info("[GRAPH] Call state transition | Call ID: %s | State: ESTABLISHED", call_id)
+                        return CallState.ESTABLISHED
+                    elif state_str == "establishing":
+                        logger.info("[GRAPH] Call state transition | Call ID: %s | State: ESTABLISHING (waiting for media handshake / callback)", call_id)
+                        return CallState.ESTABLISHING
+                    else:
+                        logger.info("[GRAPH] Call state transition | Call ID: %s | State: %s", call_id, state_str.upper())
+                        return CallState.ESTABLISHED
+                elif resp.status_code in (404, 410):
+                    logger.info("[GRAPH] Call state transition | Call ID: %s | State: TERMINATED (HTTP %d resource deleted/ended)", call_id, resp.status_code)
+                    return CallState.TERMINATED
+                else:
+                    logger.debug("[GraphCallingService] GET /communications/calls/%s returned HTTP %d: %s", call_id, resp.status_code, resp.text[:150])
+                    return CallState.ESTABLISHED
+        except Exception as exc:
+            logger.debug("[GraphCallingService] Exception querying call state for %s: %s", call_id, exc)
+            return CallState.ESTABLISHED
+
     async def join_meeting(self, join_url: str, event_id: str) -> CallRecord:
         """Join a Teams meeting by initiating a Graph Cloud Communications API call."""
         now_utc = datetime.now(timezone.utc)
@@ -337,14 +389,16 @@ class GraphCallingService:
         if self.settings.use_app_hosted_media:
             media_blob = await self.fetch_media_worker_config_blob()
             if not media_blob:
-                logger.warning(
-                    "[GraphCallingService] Could not obtain appHostedMediaConfig blob from Media Worker at %s. Falling back to serviceHostedMediaConfig.",
+                logger.error(
+                    "[GraphCallingService] CRITICAL ERROR: Application-Hosted Media mode is enabled (USE_APP_HOSTED_MEDIA=True), but Media Worker at %s returned an EMPTY media blob!\n"
+                    "[GraphCallingService] App-Hosted Media call establishment CANNOT complete without a valid appHostedMediaConfig blob. Falling back to serviceHostedMediaConfig.",
                     self.settings.media_worker_url,
                 )
             else:
                 logger.info(
-                    "[GraphCallingService] Phase 3 Application-Hosted Media mode enabled with appHostedMediaConfig for event_id=%s",
+                    "[GraphCallingService] Phase 3 Application-Hosted Media mode enabled with appHostedMediaConfig for event_id=%s (Blob length: %d)",
                     event_id,
+                    len(media_blob),
                 )
         else:
             logger.info(

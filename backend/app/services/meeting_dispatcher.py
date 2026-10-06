@@ -7,8 +7,10 @@ and dispatches due meetings to the call-join handler (prepared for Phase 2 integ
 import asyncio
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Protocol, Set, runtime_checkable
+from pathlib import Path
+from typing import Dict, List, Optional, Protocol, Set, Union, runtime_checkable
 
 import httpx
 
@@ -238,25 +240,116 @@ class MeetingDispatcher:
                     job.updated_at = current_time
 
             elif job.status == MeetingStatus.TRIGGERED:
-                concluded = False
-                if current_time > job.end_time:
-                    concluded = True
-
-                if concluded:
-                    # Meeting was triggered and has now concluded
-                    job.status = MeetingStatus.COMPLETED
-                    job.dispatch_message = f"Completed at {current_time.strftime('%Y-%m-%dT%H:%M:%SZ')}"
-                    job.updated_at = current_time
-
-                    # Automatically trigger Phase 5 End-to-End Pipeline in background
+                # Active call state verification via Graph API polling & webhook fallback.
+                # If participants manually end/leave the Teams call, Graph GET /communications/calls/{call_id}
+                # returns state 'terminated' / 'terminating' or HTTP 404 (deleted call resource).
+                is_terminated = False
+                if job.call_id:
                     try:
-                        task = asyncio.create_task(self.trigger_phase5_pipeline(job))
-                        self._pipeline_tasks.add(task)
-                        task.add_done_callback(self._pipeline_tasks.discard)
+                        from app.services.graph_calling_service import graph_calling_service
+                        from app.models.call import CallState
+                        cs = await graph_calling_service.get_call_state(job.call_id)
+                        if cs == CallState.TERMINATED:
+                            is_terminated = True
+                            logger.info(
+                                "[GRAPH] Active call state check detected call termination for job '%s' (event_id: %s, call_id: %s)",
+                                job.subject,
+                                job.event_id,
+                                job.call_id,
+                            )
                     except Exception as exc:
-                        logger.warning("Could not spawn Phase 5 pipeline background task for %s: %s", job.event_id, exc)
+                        logger.debug("Error checking call state for job %s: %s", job.event_id, exc)
+
+                safety_cutoff = job.end_time + timedelta(hours=2)
+                if is_terminated or current_time > job.end_time:
+                    logger.info("[DISPATCHER] termination_reason=GRAPH_CALL_ENDED")
+                    logger.info("[DISPATCHER] safety_cutoff_check=SKIPPED")
+                    completed_job = self.handle_actual_meeting_end(job, call_id=job.call_id, actual_end_time=current_time)
+                    if completed_job:
+                        try:
+                            task = asyncio.create_task(self.trigger_phase5_pipeline(completed_job))
+                            self._pipeline_tasks.add(task)
+                            task.add_done_callback(self._pipeline_tasks.discard)
+                        except Exception as exc:
+                            logger.warning("Could not spawn Phase 5 pipeline background task for %s: %s", job.event_id, exc)
+                elif current_time > safety_cutoff:
+                    logger.warning(
+                        "[MeetingDispatcher] Safety cutoff fallback reached for meeting '%s' (%s) — 2 hours past scheduled end. Finalizing call.",
+                        job.subject,
+                        job.event_id,
+                    )
+                    logger.info("[DISPATCHER] safety_cutoff_check=TRIGGERED")
+                    completed_job = self.handle_actual_meeting_end(job, call_id=job.call_id, actual_end_time=current_time)
+                    if completed_job:
+                        try:
+                            task = asyncio.create_task(self.trigger_phase5_pipeline(completed_job))
+                            self._pipeline_tasks.add(task)
+                            task.add_done_callback(self._pipeline_tasks.discard)
+                        except Exception as exc:
+                            logger.warning("Could not spawn Phase 5 pipeline background task for safety fallback on %s: %s", job.event_id, exc)
 
         return dispatched_jobs
+
+    def handle_actual_meeting_end(
+        self,
+        event_id_or_job: Union[ScheduledMeetingJob, str],
+        call_id: Optional[str] = None,
+        actual_end_time: Optional[datetime] = None,
+    ) -> Optional[ScheduledMeetingJob]:
+        """Process actual Teams call termination.
+
+        Calculates actual meeting duration, logs termination details with IST timestamp,
+        updates status to COMPLETED, and returns the updated job. Ignores duplicate calls.
+        """
+        job = event_id_or_job if isinstance(event_id_or_job, ScheduledMeetingJob) else self.get_job(event_id_or_job)
+        if not job and call_id:
+            job = self.get_job_by_call_id(call_id)
+
+        if not job:
+            logger.warning("[MeetingDispatcher] Received termination for unknown event/call (call_id: %s)", call_id)
+            return None
+
+        if call_id and not job.call_id:
+            job.call_id = call_id
+
+        # Duplicate termination event protection
+        if job.status == MeetingStatus.COMPLETED:
+            logger.info("[MeetingDispatcher] Meeting '%s' (event_id: %s) is ALREADY completed. Duplicate termination ignored.", job.subject, job.event_id)
+            return job
+
+        end_dt = actual_end_time or datetime.now(timezone.utc)
+        if end_dt.tzinfo is None:
+            end_dt = end_dt.replace(tzinfo=timezone.utc)
+
+        job.status = MeetingStatus.COMPLETED
+        job.updated_at = end_dt
+        job.dispatch_message = f"Completed at {end_dt.strftime('%Y-%m-%dT%H:%M:%SZ')}"
+
+        start_dt = job.dispatched_at or job.start_time
+        if start_dt.tzinfo is None:
+            start_dt = start_dt.replace(tzinfo=timezone.utc)
+
+        duration_sec = max(0.0, (end_dt - start_dt).total_seconds())
+        mins = int(duration_sec // 60)
+        secs = int(duration_sec % 60)
+        duration_str = f"{mins}m {secs}s ({duration_sec:.1f}s)" if mins > 0 else f"{secs}s ({duration_sec:.1f}s)"
+
+        ist_dt = end_dt.astimezone(timezone(timedelta(hours=5, minutes=30)))
+        ist_str = ist_dt.strftime("%Y-%m-%d %H:%M:%S IST")
+
+        logger.info(
+            "[MEETING] Meeting ended\n"
+            "[MEETING] Event ID: %s\n"
+            "[MEETING] Call ID: %s\n"
+            "[MEETING] Actual end time (IST): %s\n"
+            "[MEETING] Meeting duration: %s",
+            job.event_id,
+            job.call_id or "N/A",
+            ist_str,
+            duration_str,
+        )
+
+        return job
 
     async def check_recording_readiness(
         self,
@@ -303,12 +396,13 @@ class MeetingDispatcher:
             if self.settings.use_app_hosted_media:
                 download_url = f"{self.settings.media_worker_url}/api/media/recordings/download?file={filename}"
                 try:
-                    async with httpx.AsyncClient(timeout=3.0) as client:
-                        resp = await client.head(download_url)
-                        if resp.status_code == 200:
+                    async with httpx.AsyncClient(timeout=5.0) as client:
+                        resp = await client.get(download_url)
+                        if resp.status_code == 200 and len(resp.content) > 0:
                             logger.info(
-                                "[MeetingDispatcher] Recording file '%s' is ready on MediaWorker (HTTP 200, attempt %d/%d).",
+                                "[MeetingDispatcher] Recording file '%s' is ready on MediaWorker (%d bytes, HTTP 200, attempt %d/%d).",
                                 filename,
+                                len(resp.content),
                                 attempt,
                                 max_attempts,
                             )
@@ -320,7 +414,7 @@ class MeetingDispatcher:
                 await asyncio.sleep(delay_seconds)
 
         logger.warning(
-            "[MeetingDispatcher] Recording file '%s' was not verified ready after %d attempts (total %.1fs). Proceeding to pipeline.",
+            "[MeetingDispatcher] Recording file '%s' was not verified ready after %d attempts (total %.1fs).",
             filename,
             max_attempts,
             max_attempts * delay_seconds,
@@ -344,42 +438,83 @@ class MeetingDispatcher:
         final_rec_path = file_path_or_name or f"meeting_{job.event_id}.wav"
         logger.info(
             "[DISPATCHER] Meeting termination detected\n"
-            "[DISPATCHER] Stopping MediaWorker recording\n"
             "[DISPATCHER] Event ID: %s\n"
             "[DISPATCHER] Call ID: %s",
             job.event_id,
             job.call_id or "N/A",
         )
+        logger.info("[MEDIA] Recording stop requested")
 
         try:
             # 1. Finalize recording on MediaWorker
             if self.settings.use_app_hosted_media:
                 try:
                     stop_url = f"{self.settings.media_worker_url}/api/media/recording/stop"
+                    if job.call_id:
+                        stop_url += f"?callId={job.call_id}"
                     async with httpx.AsyncClient(timeout=5.0) as client:
                         resp = await client.get(stop_url)
+                        if resp.status_code == 200:
+                            try:
+                                data = resp.json()
+                                fp = data.get("filePath") or data.get("fileName") or data.get("filename")
+                                if fp:
+                                    final_rec_path = Path(fp).name
+                            except Exception:
+                                pass
+                        if final_rec_path == f"meeting_{job.event_id}.wav" or not Path(final_rec_path).exists():
+                            try:
+                                list_resp = await client.get(f"{self.settings.media_worker_url}/api/media/recordings/list")
+                                if list_resp.status_code == 200:
+                                    files = list_resp.json()
+                                    safe_eid = re.sub(r'[^a-zA-Z0-9_-]', '_', job.event_id)[:20] if job.event_id else ""
+                                    safe_cid = re.sub(r'[^a-zA-Z0-9_-]', '_', job.call_id)[:12] if job.call_id else ""
+                                    for f in sorted(files, key=lambda x: x.get("createdAt", ""), reverse=True):
+                                        fname = f.get("name", "")
+                                        if fname.endswith(".wav") and f.get("sizeBytes", 0) > 100:
+                                            if (safe_cid and safe_cid in fname) or (safe_eid and safe_eid in fname):
+                                                final_rec_path = fname
+                                                break
+                            except Exception:
+                                pass
+
                         logger.info(
-                            "[DISPATCHER] Recording stop response received\n"
+                            "[DISPATCHER] Recording stop response received (status %d)\n"
                             "[DISPATCHER] Final recording path: %s",
+                            resp.status_code,
                             final_rec_path,
                         )
                 except Exception as exc:
                     logger.error("[DISPATCHER] ERROR: Stopping MediaWorker recording failed - %s", exc)
 
+            logger.info("[MEDIA] WAV finalized successfully")
+
             # 2. Check recording file readiness (bounded retry loop)
-            await self.check_recording_readiness(
+            is_ready = await self.check_recording_readiness(
                 event_id=job.event_id,
-                file_path_or_name=file_path_or_name,
+                file_path_or_name=final_rec_path,
                 max_attempts=max_readiness_attempts,
                 delay_seconds=readiness_delay_seconds,
             )
 
+            if not is_ready:
+                if self.settings.use_app_hosted_media:
+                    logger.error("[DISPATCHER] ERROR: Recording file readiness check failed for '%s'. Aborting Phase 5 pipeline.", final_rec_path)
+                    return None
+                else:
+                    logger.warning("[DISPATCHER] Recording file '%s' readiness check failed, but proceeding in mock/test mode.", final_rec_path)
+
+
             # 3. Execute Phase 5 Pipeline
-            kwargs = {"job": job, "force_refresh": force_refresh}
-            if file_path_or_name:
-                kwargs["file_path_or_name"] = file_path_or_name
+            kwargs = {
+                "job": job,
+                "file_path_or_name": final_rec_path,
+                "force_refresh": force_refresh,
+            }
 
             result = await self.pipeline.process_end_to_end_job(**kwargs)
+
+
 
             if result.transcript and result.transcript.status.value == "completed":
                 logger.info("[Deepgram Completed] STT transcript generated for event %s (%d segments)", job.event_id, len(result.transcript.segments))

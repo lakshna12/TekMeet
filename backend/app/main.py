@@ -68,6 +68,7 @@ app.add_middleware(
 # Include Routers
 app.include_router(auth_router)
 app.include_router(calls_router)
+app.include_router(calls_router, prefix="/api/calls", tags=["Calls (Alias)"])
 app.include_router(meetings_router)
 app.include_router(scheduler_router)
 app.include_router(transcripts_router)

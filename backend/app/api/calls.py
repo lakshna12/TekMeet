@@ -57,6 +57,40 @@ def list_call_records() -> List[CallRecord]:
 
 
 @router.post(
+    "/join",
+    summary="Join a Teams meeting by URL",
+    status_code=status.HTTP_201_CREATED,
+)
+async def join_meeting_endpoint(payload: dict = Body(...)):
+    """Initiate bot join into a Microsoft Teams meeting given a join_url."""
+    join_url = payload.get("join_url") or payload.get("joinUrl") or payload.get("url")
+    if not join_url:
+        raise HTTPException(status_code=400, detail="Missing required 'join_url' field in request body.")
+
+    event_id = payload.get("event_id") or payload.get("eventId")
+    if not event_id:
+        import uuid
+        event_id = f"event_{uuid.uuid4().hex[:8]}"
+
+    from app.services.graph_calling_service import graph_calling_service
+    record = await graph_calling_service.join_meeting(join_url, event_id)
+
+    if record.call_id:
+        job = ScheduledMeetingJob(
+            event_id=event_id,
+            subject="Teams Meeting",
+            start_time=datetime.now(timezone.utc),
+            end_time=datetime.now(timezone.utc),
+            call_id=record.call_id,
+            join_url=join_url,
+            status=MeetingStatus.TRIGGERED,
+        )
+        meeting_dispatcher._jobs[event_id] = job
+
+    return record
+
+
+@router.post(
     "/callback",
     summary="Graph Calling API notification callback webhook endpoint",
     status_code=status.HTTP_202_ACCEPTED,
@@ -82,6 +116,23 @@ async def handle_graph_call_notification(notification: dict = Body(...)):
         call_id = resource_data.get("id") or item.get("id")
         call_state = (resource_data.get("state") or item.get("state") or "").lower()
         change_type = (item.get("changeType") or "").lower()
+        result_info = resource_data.get("resultInfo") or item.get("resultInfo")
+
+        if result_info:
+            logger.info(
+                "[GRAPH Webhook] ResultInfo for call %s | Code: %s | Subcode: %s | Message: %s",
+                call_id or "N/A",
+                result_info.get("code"),
+                result_info.get("subcode"),
+                result_info.get("message"),
+            )
+
+        logger.info(
+            "[GRAPH Webhook] Call state transition | Call ID: %s | State: %s | ChangeType: %s",
+            call_id or "N/A",
+            call_state.upper() if call_state else "UNKNOWN",
+            change_type or "N/A",
+        )
 
         if call_state in ("terminated", "deleted") or change_type == "deleted":
             logger.info(
@@ -106,26 +157,14 @@ async def handle_graph_call_notification(notification: dict = Body(...)):
                     start_time=datetime.now(timezone.utc),
                     end_time=datetime.now(timezone.utc),
                     call_id=call_id,
-                    status=MeetingStatus.COMPLETED,
+                    status=MeetingStatus.TRIGGERED,
                 )
                 meeting_dispatcher._jobs[job.event_id] = job
 
-            job.status = MeetingStatus.COMPLETED
-            rec_file = f"meeting_{job.event_id}.wav"
-            logger.info(
-                "[MEETING] Meeting ended\n"
-                "[MEETING] Event ID: %s\n"
-                "[MEETING] Call ID: %s\n"
-                "[RECORDING] Stop triggered\n"
-                "[RECORDING] Finalizing recording\n"
-                "[RECORDING] Recording finalized\n"
-                "[RECORDING] File: %s",
-                job.event_id,
-                job.call_id or "N/A",
-                rec_file,
-            )
-            asyncio.create_task(meeting_dispatcher.trigger_phase5_pipeline(job))
-            triggered_events.append(job.event_id)
+            completed_job = meeting_dispatcher.handle_actual_meeting_end(job, call_id=call_id)
+            if completed_job:
+                asyncio.create_task(meeting_dispatcher.trigger_phase5_pipeline(completed_job))
+                triggered_events.append(completed_job.event_id)
 
     return {
         "status": "accepted",
@@ -164,26 +203,16 @@ async def handle_recording_stopped_callback(payload: dict = Body(...)):
             start_time=datetime.now(timezone.utc),
             end_time=datetime.now(timezone.utc),
             call_id=call_id,
-            status=MeetingStatus.COMPLETED,
+            status=MeetingStatus.TRIGGERED,
         )
         meeting_dispatcher._jobs[job.event_id] = job
 
-    job.status = MeetingStatus.COMPLETED
-    rec_file = file_name or f"meeting_{job.event_id}.wav"
-    logger.info(
-        "[MEETING] Meeting ended\n"
-        "[MEETING] Event ID: %s\n"
-        "[MEETING] Call ID: %s\n"
-        "[RECORDING] Stop triggered\n"
-        "[RECORDING] Finalizing recording\n"
-        "[RECORDING] Recording finalized\n"
-        "[RECORDING] File: %s",
-        job.event_id,
-        job.call_id or "N/A",
-        rec_file,
-    )
-    asyncio.create_task(meeting_dispatcher.trigger_phase5_pipeline(job, file_path_or_name=file_name))
-    return {"status": "accepted", "event_id": job.event_id, "message": "Phase 5 pipeline started in background"}
+    completed_job = meeting_dispatcher.handle_actual_meeting_end(job, call_id=call_id)
+    if completed_job:
+        asyncio.create_task(meeting_dispatcher.trigger_phase5_pipeline(completed_job, file_path_or_name=file_name))
+    logger.info("[CallsAPI Webhook] Recording-stopped callback acknowledged for event %s (file: %s)", job.event_id if job else "N/A", file_name)
+    return {"status": "accepted", "event_id": job.event_id if job else None, "message": "Recording stopped accepted"}
+
 
 
 @router.get(

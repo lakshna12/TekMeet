@@ -43,6 +43,9 @@ namespace MediaWorker
 
             logger.LogInformation("Starting TekMeet C# Media Worker Service (.NET Framework 4.8 win-x64)...");
             logger.LogInformation("HTTP Bridge Listener running on http://localhost:{Port}/", port);
+            logger.LogInformation("[MEDIA] Runtime executable/base directory: {BaseDir}", AppDomain.CurrentDomain.BaseDirectory);
+            logger.LogInformation("[MEDIA] Runtime current directory: {CurrentDir}", Directory.GetCurrentDirectory());
+            logger.LogInformation("[MEDIA] Canonical recordings directory: {RecDir}", AudioRecordingService.GetCanonicalRecordingsDirectory());
 
             bool isWindowsService = !Environment.UserInteractive && Array.Exists(args, a => a.Equals("--service", StringComparison.OrdinalIgnoreCase));
             if (isWindowsService)
@@ -62,22 +65,43 @@ namespace MediaWorker
         {
             Task.Run(async () =>
             {
-                using (var listener = new HttpListener())
+                var listener = new HttpListener();
+                bool started = false;
+
+                // Attempt 1: Wildcard listener for all network interfaces (requires Admin or URL ACL)
+                try
                 {
-                    try { listener.Prefixes.Add($"http://+:{port}/"); } catch { }
-                    listener.Prefixes.Add($"http://localhost:{port}/");
-                    listener.Prefixes.Add($"http://127.0.0.1:{port}/");
+                    listener.Prefixes.Add($"http://+:{port}/");
+                    listener.Start();
+                    started = true;
+                    logger.LogInformation("HTTP Bridge Listener started on http://+:{Port}/", port);
+                }
+                catch
+                {
+                    try { listener.Close(); } catch { }
+                    listener = new HttpListener();
+                }
+
+                // Attempt 2: Localhost & 127.0.0.1 listener (works without Admin privileges)
+                if (!started)
+                {
                     try
                     {
+                        listener.Prefixes.Add($"http://localhost:{port}/");
+                        listener.Prefixes.Add($"http://127.0.0.1:{port}/");
                         listener.Start();
-                        logger.LogInformation("HTTP Bridge Listener started on port {Port}.", port);
+                        started = true;
+                        logger.LogInformation("HTTP Bridge Listener started on http://localhost:{Port}/", port);
                     }
                     catch (Exception ex)
                     {
                         logger.LogWarning(ex, "Could not start HttpListener on port {Port}.", port);
                         return;
                     }
+                }
 
+                using (listener)
+                {
                     while (listener.IsListening)
                     {
                         try
@@ -149,10 +173,46 @@ namespace MediaWorker
 
                 if (path == "/api/media/recording/stop")
                 {
+                    logger.LogInformation("[MEDIA] STOP callId={CallId}", recordingService.CurrentCallId ?? "N/A");
+                    string curPath = recordingService.CurrentFilePath ?? string.Empty;
+                    logger.LogInformation("[MEDIA] Current recording file path = {Path}", curPath);
+                    bool fileExistsBefore = !string.IsNullOrEmpty(curPath) && File.Exists(curPath);
+                    logger.LogInformation("[MEDIA] File.Exists = {Exists}", fileExistsBefore);
+                    logger.LogInformation("[MEDIA] File length = {Length}", fileExistsBefore ? new FileInfo(curPath).Length : 0);
+
+                    string recDir = AudioRecordingService.GetCanonicalRecordingsDirectory();
+                    bool dirExists = Directory.Exists(recDir);
+                    logger.LogInformation("[MEDIA] Directory.Exists = {Exists}", dirExists);
+                    if (dirExists)
+                    {
+                        string[] contents = Directory.GetFiles(recDir);
+                        logger.LogInformation("[MEDIA] Directory contents = {Contents}", string.Join(", ", contents));
+                    }
+
                     recordingService.StopRecording();
+
                     string filePath = recordingService.CurrentFilePath ?? string.Empty;
-                    string json = $"{{\"status\":\"stopped\",\"filePath\":\"{filePath.Replace("\\", "\\\\")}\"}}";
+                    string fileName = !string.IsNullOrEmpty(filePath) ? Path.GetFileName(filePath) : string.Empty;
+                    long fileSize = (!string.IsNullOrEmpty(filePath) && File.Exists(filePath)) ? new FileInfo(filePath).Length : 0;
+
+                    logger.LogInformation("[MEDIA] FINAL WAV PATH = {Path}", filePath);
+                    logger.LogInformation("[MEDIA] FINAL WAV EXISTS = {Exists}", File.Exists(filePath));
+                    logger.LogInformation("[MEDIA] FINAL WAV SIZE = {Size}", fileSize);
+
+                    if (fileSize == 0 || string.IsNullOrEmpty(fileName))
+                    {
+                        resp.StatusCode = 500;
+                        string errJson = $"{{\"status\":\"error\",\"message\":\"No recording file produced or file is 0 bytes\",\"fileName\":\"{fileName}\",\"fileSize\":0}}";
+                        byte[] errBuf = Encoding.UTF8.GetBytes(errJson);
+                        resp.ContentType = "application/json";
+                        resp.OutputStream.Write(errBuf, 0, errBuf.Length);
+                        resp.Close();
+                        return;
+                    }
+
+                    string json = $"{{\"status\":\"stopped\",\"filePath\":\"{filePath.Replace("\\", "\\\\")}\",\"fileName\":\"{fileName}\",\"fileSize\":{fileSize}}}";
                     byte[] buf = Encoding.UTF8.GetBytes(json);
+                    resp.ContentType = "application/json";
                     resp.OutputStream.Write(buf, 0, buf.Length);
                     resp.Close();
                     return;
@@ -195,14 +255,40 @@ namespace MediaWorker
                         return;
                     }
 
-                    string directory = req.QueryString["directory"] ?? "recordings";
-                    string fullDir = Path.IsPathRooted(directory) ? directory : Path.Combine(AppDomain.CurrentDomain.BaseDirectory, directory);
+                    string fullDir = AudioRecordingService.GetCanonicalRecordingsDirectory();
                     string targetFile = Path.Combine(fullDir, Path.GetFileName(fileName));
 
                     if (!File.Exists(targetFile))
                     {
+                        string cwdFile = Path.Combine(Directory.GetCurrentDirectory(), "recordings", Path.GetFileName(fileName));
+                        if (File.Exists(cwdFile))
+                        {
+                            targetFile = cwdFile;
+                        }
+                        else
+                        {
+                            string rootFile = Path.Combine(Directory.GetCurrentDirectory(), Path.GetFileName(fileName));
+                            if (File.Exists(rootFile))
+                            {
+                                targetFile = rootFile;
+                            }
+                        }
+                    }
+
+                    bool targetExists = File.Exists(targetFile);
+                    long targetLength = targetExists ? new FileInfo(targetFile).Length : 0;
+
+                    logger.LogInformation("[MEDIA] DOWNLOAD requested file = {File}", fileName);
+                    logger.LogInformation("[MEDIA] Resolved full path = {Path}", targetFile);
+                    logger.LogInformation("[MEDIA] File.Exists = {Exists}", targetExists);
+                    logger.LogInformation("[MEDIA] File size = {Size}", targetLength);
+                    logger.LogInformation("[MEDIA] Base directory = {BaseDir}", AppDomain.CurrentDomain.BaseDirectory);
+                    logger.LogInformation("[MEDIA] Recordings directory = {RecDir}", fullDir);
+
+                    if (!targetExists || targetLength == 0)
+                    {
                         resp.StatusCode = 404;
-                        byte[] errBuf = Encoding.UTF8.GetBytes("{\"error\":\"File not found\"}");
+                        byte[] errBuf = Encoding.UTF8.GetBytes("{\"error\":\"File not found or 0 bytes\"}");
                         resp.OutputStream.Write(errBuf, 0, errBuf.Length);
                         resp.Close();
                         return;
@@ -216,6 +302,7 @@ namespace MediaWorker
                     resp.Close();
                     return;
                 }
+
 
                 resp.StatusCode = 404;
                 byte[] err = Encoding.UTF8.GetBytes("{\"error\":\"Not Found\"}");
@@ -232,15 +319,26 @@ namespace MediaWorker
         {
             try
             {
-                string dir = Directory.GetCurrentDirectory();
-                string envPath = Path.Combine(dir, ".env");
-                if (!File.Exists(envPath))
+                string? current = Directory.GetCurrentDirectory();
+                string? envPath = null;
+                for (int i = 0; i < 5 && !string.IsNullOrEmpty(current); i++)
                 {
-                    string parentEnv = Path.Combine(dir, "..", ".env");
-                    if (File.Exists(parentEnv)) envPath = parentEnv;
+                    string candidate = Path.Combine(current, ".env");
+                    if (File.Exists(candidate))
+                    {
+                        envPath = candidate;
+                        break;
+                    }
+                    current = Directory.GetParent(current)?.FullName;
                 }
 
-                if (File.Exists(envPath))
+                if (string.IsNullOrEmpty(envPath) || !File.Exists(envPath))
+                {
+                    string baseDirEnv = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".env");
+                    if (File.Exists(baseDirEnv)) envPath = baseDirEnv;
+                }
+
+                if (!string.IsNullOrEmpty(envPath) && File.Exists(envPath))
                 {
                     foreach (var line in File.ReadAllLines(envPath))
                     {

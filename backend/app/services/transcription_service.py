@@ -347,44 +347,23 @@ class TranscriptionService:
                 except Exception as exc:
                     logger.error("[TranscriptionService] Could not read file '%s': %s", path, exc)
 
-        # Fallback: scan candidate directories for latest .wav file if exact match not found
-        if not any(k in file_name.lower() for k in ["non_existent", "missing_", "test_missing"]):
-            candidate_dirs = [
-                project_dir / "recordings",
-                backend_dir / "recordings",
-                user_downloads_dir,
-                Path(r"C:\Users\lakshnavm\Desktop\TeekMeet-Zip\TekMeet\media_worker\bin\publish\recordings"),
-            ]
-            for cdir in candidate_dirs:
-                if cdir.exists() and cdir.is_dir():
-                    wav_files = sorted(cdir.glob("*.wav"), key=lambda p: p.stat().st_mtime, reverse=True)
-                    for wpath in wav_files:
-                        if wpath.stat().st_size > 1000:
-                            try:
-                                logger.info("[TranscriptionService] Fallback scan matched latest recording file: %s (%d bytes)", wpath, wpath.stat().st_size)
-                                with open(wpath, "rb") as f:
-                                    data = f.read()
-                                _save_to_downloads(data, wpath.name)
-                                return str(wpath), data, wpath.name, None
-                            except Exception as exc:
-                                logger.error("[TranscriptionService] Could not read fallback recording '%s': %s", wpath, exc)
-
         # Attempt to fetch from MediaWorker endpoint if not found locally
-        download_url = f"{self.settings.media_worker_url}/api/media/recordings/download?file={file_name}"
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.get(download_url)
-                if resp.status_code == 200 and resp.content:
-                    _save_to_downloads(resp.content, file_name)
-                    return None, resp.content, file_name, None
-                return (
-                    None,
-                    b"",
-                    file_name,
-                    (TranscriptionStatus.FAILED, f"File not found on MediaWorker (HTTP {resp.status_code})"),
-                )
-        except Exception as exc:
-            return None, b"", file_name, (TranscriptionStatus.FAILED, f"File not found locally or on MediaWorker: {exc}")
+        if self.settings.use_app_hosted_media or not file_name.startswith("test_"):
+            download_url = f"{self.settings.media_worker_url}/api/media/recordings/download?file={file_name}"
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    resp = await client.get(download_url)
+                    if resp.status_code == 200 and resp.content:
+                        _save_to_downloads(resp.content, file_name)
+                        return None, resp.content, file_name, None
+                    logger.error("[TranscriptionService] File '%s' not found on MediaWorker endpoint (HTTP %d)", file_name, resp.status_code)
+            except Exception as exc:
+                logger.error("[TranscriptionService] Error downloading file '%s' from MediaWorker: %s", file_name, exc)
+
+        err_msg = f"Current meeting recording not found: '{file_name}'"
+        logger.error("[TranscriptionService] ERROR: %s", err_msg)
+        return None, b"", file_name, (TranscriptionStatus.FAILED, err_msg)
+
 
     def _build_transcript_from_dict(
         self, transcript_id: str, event_id: str, call_id: Optional[str], file_name: str, data: dict

@@ -309,7 +309,14 @@ class SummarizationService:
             f"MEETING TRANSCRIPT:\n{transcript_text}"
         )
 
-        models_to_try = [self.settings.gemini_model, "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro", "gemini-flash-latest"]
+        models_to_try = [
+            self.settings.gemini_model,
+            "gemini-3.8-flash",
+            "gemini-3.5-flash",
+            "gemini-3.1-flash-lite",
+            "gemini-flash-latest",
+            "gemini-pro-latest",
+        ]
         # Deduplicate while preserving order
         unique_models = []
         for m in models_to_try:
@@ -347,7 +354,7 @@ class SummarizationService:
 
                             return parts[0]["text"]
 
-                        elif resp.status_code in (503, 404, 429) and attempt < max_attempts:
+                        elif resp.status_code in (503, 429) and attempt < max_attempts:
                             logger.warning(
                                 "[SummarizationService] Gemini API model '%s' returned HTTP %d (attempt %d/%d). Retrying in 2s...",
                                 model, resp.status_code, attempt, max_attempts

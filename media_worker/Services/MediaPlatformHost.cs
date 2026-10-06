@@ -1,6 +1,8 @@
 using System;
 using System.Net;
 using System.Reflection;
+using System.Security.Cryptography.X509Certificates;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Configuration;
@@ -17,7 +19,7 @@ namespace MediaWorker.Services
         public int MediaUdpPortStart { get; set; } = 20000;
         public int MediaUdpPortEnd { get; set; } = 20050;
         public int InternalPort { get; set; } = 8445;
-        public int PublicPort { get; set; } = 443;
+        public int PublicPort { get; set; } = 8445;
         public string? AppId { get; set; }
         public string? CertificateThumbprint { get; set; }
     }
@@ -97,7 +99,7 @@ namespace MediaWorker.Services
             }
         }
 
-        public Task StartAsync(CancellationToken cancellationToken)
+        public async Task StartAsync(CancellationToken cancellationToken)
         {
             _logger.LogInformation("=== TEKMEET MEDIA WORKER: INITIALIZING MEDIA PLATFORM ===");
             _logger.LogInformation("Configuration Structure:");
@@ -107,59 +109,112 @@ namespace MediaWorker.Services
             _logger.LogInformation("  - Public Port        : {PublicPort}", _options.PublicPort);
             _logger.LogInformation("  - UDP Port Range     : {Start} - {End}", _options.MediaUdpPortStart, _options.MediaUdpPortEnd);
 
+            var rawThumbprint = _options.CertificateThumbprint ?? string.Empty;
+            var cleanThumbprint = Regex.Replace(rawThumbprint, @"[^a-fA-F0-9]", "").ToUpperInvariant();
+            _logger.LogInformation("  - Cert Thumbprint    : {Thumbprint} (Sanitized from: {Raw})", cleanThumbprint, rawThumbprint);
+
             var maskedAppId = string.IsNullOrEmpty(_options.AppId)
                 ? "(Not set)"
                 : (_options.AppId.Length > 8 ? _options.AppId.Substring(0, 8) + "..." : _options.AppId);
             _logger.LogInformation("  - App ID             : {AppId}", maskedAppId);
 
-            Task.Run(async () =>
+            InspectCertificateStore(cleanThumbprint);
+
+            if (!string.IsNullOrWhiteSpace(_options.PublicIp) &&
+                !string.IsNullOrWhiteSpace(_options.MediaFqdn) &&
+                !string.IsNullOrWhiteSpace(_options.AppId))
             {
                 try
                 {
-                    if (!string.IsNullOrWhiteSpace(_options.PublicIp) &&
-                        !string.IsNullOrWhiteSpace(_options.MediaFqdn) &&
-                        !string.IsNullOrWhiteSpace(_options.AppId))
+                    var instanceSettings = new MediaPlatformInstanceSettings
                     {
-                        var instanceSettings = new MediaPlatformInstanceSettings
-                        {
-                            CertificateThumbprint = _options.CertificateThumbprint ?? string.Empty,
-                            InstanceInternalPort = _options.InternalPort,
-                            InstancePublicPort = _options.PublicPort,
-                            InstancePublicIPAddress = IPAddress.Parse(_options.PublicIp),
-                            ServiceFqdn = _options.MediaFqdn
-                        };
+                        CertificateThumbprint = cleanThumbprint,
+                        InstanceInternalPort = _options.InternalPort,
+                        InstancePublicPort = _options.PublicPort,
+                        InstancePublicIPAddress = IPAddress.Parse(_options.PublicIp),
+                        ServiceFqdn = _options.MediaFqdn
+                    };
 
-                        var settings = new MediaPlatformSettings
-                        {
-                            ApplicationId = _options.AppId,
-                            MediaPlatformInstanceSettings = instanceSettings
-                        };
+                    var settings = new MediaPlatformSettings
+                    {
+                        ApplicationId = _options.AppId,
+                        MediaPlatformInstanceSettings = instanceSettings
+                    };
 
-                        try
-                        {
-                            MediaPlatform.Shutdown();
-                        }
-                        catch { }
-
-                        await Task.Delay(1000);
-
-                        MediaPlatform.Initialize(settings);
-                        _isInitialized = true;
-                        _logger.LogInformation("SUCCESS: Microsoft Skype/Graph Real-Time Media Platform initialized successfully.");
+                    _logger.LogInformation("[MediaPlatform] Calling MediaPlatform.Shutdown() prior to initialization...");
+                    try
+                    {
+                        MediaPlatform.Shutdown();
                     }
-                    else
+                    catch { }
+
+                    await Task.Delay(500, cancellationToken);
+
+                    _logger.LogInformation("[MediaPlatform] Invoking MediaPlatform.Initialize(settings)...");
+                    MediaPlatform.Initialize(settings);
+                    _isInitialized = true;
+                    _logger.LogInformation("SUCCESS: Microsoft Skype/Graph Real-Time Media Platform initialized successfully. IsInitialized=True");
+                }
+                catch (Exception ex)
+                {
+                    _isInitialized = false;
+                    _logger.LogError(ex, "ERROR: Failed to initialize Microsoft Real-Time Media Platform.\n" +
+                                         "  - Message: {Message}\n" +
+                                         "  - Type: {Type}\n" +
+                                         "  - InnerException: {Inner}",
+                                         ex.Message,
+                                         ex.GetType().FullName,
+                                         ex.InnerException != null ? $"{ex.InnerException.GetType().FullName}: {ex.InnerException.Message}" : "None");
+                }
+            }
+            else
+            {
+                _logger.LogWarning("NOTICE: Real-Time Media Platform settings (PUBLIC_IP, MEDIA_FQDN) are incomplete. Platform initialization deferred.");
+            }
+        }
+
+        private void InspectCertificateStore(string targetThumbprint)
+        {
+            _logger.LogInformation("=== [CERT CHECK] Inspecting Windows Certificate Stores ===");
+            bool matchFound = false;
+
+            foreach (var location in new[] { StoreLocation.LocalMachine, StoreLocation.CurrentUser })
+            {
+                try
+                {
+                    using (var store = new X509Store(StoreName.My, location))
                     {
-                        _logger.LogWarning("NOTICE: Real-Time Media Platform settings (PUBLIC_IP, MEDIA_FQDN) are incomplete. Platform initialization deferred to runtime configuration.");
+                        store.Open(OpenFlags.ReadOnly);
+                        var certs = store.Certificates;
+                        _logger.LogInformation("[CERT CHECK] StoreLocation.{Location} contains {Count} certificates.", location, certs.Count);
+
+                        foreach (var cert in certs)
+                        {
+                            string certThumb = cert.Thumbprint?.Replace(" ", "").ToUpperInvariant() ?? "";
+                            bool isMatch = string.Equals(certThumb, targetThumbprint, StringComparison.OrdinalIgnoreCase);
+                            if (isMatch)
+                            {
+                                matchFound = true;
+                                _logger.LogInformation("[CERT CHECK] MATCH FOUND in StoreLocation.{Location}!\n" +
+                                                       "  - Subject       : {Subject}\n" +
+                                                       "  - Thumbprint    : {Thumb}\n" +
+                                                       "  - HasPrivateKey : {HasKey}\n" +
+                                                       "  - NotAfter      : {Expiration}",
+                                                       location, cert.Subject, certThumb, cert.HasPrivateKey, cert.NotAfter.ToString("o"));
+                            }
+                        }
                     }
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "ERROR: Failed to initialize Microsoft Real-Time Media Platform.");
-                    _isInitialized = false;
+                    _logger.LogWarning(ex, "[CERT CHECK] Could not inspect StoreLocation.{Location}", location);
                 }
-            });
+            }
 
-            return Task.CompletedTask;
+            if (!matchFound)
+            {
+                _logger.LogWarning("[CERT CHECK] WARNING: Certificate with thumbprint '{TargetThumb}' was NOT found in LocalMachine\\My or CurrentUser\\My stores.", targetThumbprint);
+            }
         }
 
         public Task StopAsync(CancellationToken cancellationToken)

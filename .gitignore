@@ -1,47 +1,98 @@
-# Python bytecode & cache
+# ==========================================
+# Python
+# ==========================================
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.pyo
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .venv/
-backend/.venv/
 venv/
+env/
+backend/.venv/
 
-# Environment configuration & secrets (SECURITY CRITICAL)
+# Python packaging & coverage
+*.egg-info/
+dist/
+build/
+.coverage
+htmlcov/
+
+# ==========================================
+# Environment / Secrets
+# ==========================================
 .env
-backend/.env
-.env.local
 .env.*
+backend/.env
 !.env.example
 
-# OS & IDE metadata
-.DS_Store
-.vscode/
-.idea/
+# ==========================================
+# Recordings & Media Files
+# ==========================================
+*.wav
+*.mp3
+*.mp4
+*.m4a
+*.nv12
+recordings/
+media_worker/recordings/
+backend/recordings/
 
-# Database files & local registries
+# ==========================================
+# Logs / Temporary Files
+# ==========================================
+*.log
+logs/
+tmp/
+temp/
+scratch/
+cache/
+
+# ==========================================
+# Database & Local Storage
+# ==========================================
 backend/app/data/*.db
 backend/app/data/*.json
 *.sqlite3
+backend/tekmeet.db
 
-# Audio recordings & media binaries
-recordings/
-*.wav
-*.mp4
-*.m4a
-
-# Temporary scratch files & build outputs
-scratch/
-dist/
-build/
-node_modules/
-cache/
-
-# .NET build outputs
-media_worker/bin/
-media_worker/obj/
+# ==========================================
+# .NET / C# Build & Publish Outputs
+# ==========================================
 bin/
 obj/
-media_worker/ffmpeg.exe
+publish/
+media_worker/bin/
+media_worker/obj/
+media_worker/publish/
 *.exe
+media_worker/ffmpeg.exe
 
-backend/tekmeet.db
+# ==========================================
+# Frontend (Node / Next.js)
+# ==========================================
+node_modules/
+frontend/node_modules/
+.next/
+frontend/.next/
+out/
+frontend/out/
+
+# ==========================================
+# IDE & Editor Files
+# ==========================================
+.vscode/
+.vs/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# ==========================================
+# OS Generated Files
+# ==========================================
+.DS_Store
+Thumbs.db
