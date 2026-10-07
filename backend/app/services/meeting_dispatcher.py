@@ -259,23 +259,12 @@ class MeetingDispatcher:
                             )
                     except Exception as exc:
                         logger.debug("Error checking call state for job %s: %s", job.event_id, exc)
-                else:
-                    # In mock/test environments without a Graph call_id, transition when past end_time
-                    if current_time > job.end_time:
-                        is_terminated = True
 
-                safety_cutoff = (job.dispatched_at or job.start_time) + timedelta(hours=4)
-                if is_terminated or current_time > safety_cutoff:
-                    if is_terminated:
-                        logger.info("[DISPATCHER] termination_reason=GRAPH_CALL_ENDED")
-                        logger.info("[DISPATCHER] safety_cutoff_check=SKIPPED")
-                    else:
-                        logger.warning(
-                            "[MeetingDispatcher] Safety cutoff fallback reached for meeting '%s' (%s) — 4 hours past start. Finalizing call.",
-                            job.subject,
-                            job.event_id,
-                        )
-                        logger.info("[DISPATCHER] safety_cutoff_check=TRIGGERED")
+                safety_cutoff = job.end_time + timedelta(hours=2)
+                should_end = is_terminated or (not job.call_id and current_time > job.end_time) or (current_time > safety_cutoff)
+                if should_end:
+                    logger.info("[DISPATCHER] termination_reason=GRAPH_CALL_ENDED" if is_terminated else "[DISPATCHER] termination_reason=SCHEDULED_OR_SAFETY_END")
+                    logger.info("[DISPATCHER] safety_cutoff_check=SKIPPED" if is_terminated else "[DISPATCHER] safety_cutoff_check=TRIGGERED")
                     completed_job = self.handle_actual_meeting_end(job, call_id=job.call_id, actual_end_time=current_time)
                     if completed_job:
                         try:
@@ -284,6 +273,21 @@ class MeetingDispatcher:
                             task.add_done_callback(self._pipeline_tasks.discard)
                         except Exception as exc:
                             logger.warning("Could not spawn Phase 5 pipeline background task for %s: %s", job.event_id, exc)
+                elif current_time > safety_cutoff:
+                    logger.warning(
+                        "[MeetingDispatcher] Safety cutoff fallback reached for meeting '%s' (%s) — 2 hours past scheduled end. Finalizing call.",
+                        job.subject,
+                        job.event_id,
+                    )
+                    logger.info("[DISPATCHER] safety_cutoff_check=TRIGGERED")
+                    completed_job = self.handle_actual_meeting_end(job, call_id=job.call_id, actual_end_time=current_time)
+                    if completed_job:
+                        try:
+                            task = asyncio.create_task(self.trigger_phase5_pipeline(completed_job))
+                            self._pipeline_tasks.add(task)
+                            task.add_done_callback(self._pipeline_tasks.discard)
+                        except Exception as exc:
+                            logger.warning("Could not spawn Phase 5 pipeline background task for safety fallback on %s: %s", job.event_id, exc)
 
         return dispatched_jobs
 

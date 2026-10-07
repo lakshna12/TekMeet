@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from typing import Dict, List, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from fastapi import APIRouter, HTTPException, status, Body
 
@@ -76,17 +76,15 @@ async def join_meeting_endpoint(payload: dict = Body(...)):
     record = await graph_calling_service.join_meeting(join_url, event_id)
 
     if record.call_id:
-        from datetime import timedelta
-        now_utc = datetime.now(timezone.utc)
+        now = datetime.now(timezone.utc)
         job = ScheduledMeetingJob(
             event_id=event_id,
             subject=payload.get("subject") or "Teams Meeting",
-            start_time=now_utc,
-            end_time=now_utc + timedelta(hours=2),
+            start_time=now,
+            end_time=now + timedelta(hours=4),
             call_id=record.call_id,
             join_url=join_url,
             status=MeetingStatus.TRIGGERED,
-            dispatched_at=now_utc,
         )
         meeting_dispatcher._jobs[event_id] = job
 
