@@ -331,7 +331,7 @@ class SummarizationService:
                 "contents": [{"parts": [{"text": prompt}]}],
                 "generationConfig": {
                     "temperature": 0.2,
-                    "maxOutputTokens": 1500,
+                    "maxOutputTokens": 8192,
                     "responseMimeType": "application/json",
                 },
             }
@@ -383,13 +383,29 @@ class SummarizationService:
         try:
             return json.loads(cleaned)
         except json.JSONDecodeError as exc:
-            logger.warning("[SummarizationService] Direct JSON parse failed: %s. Attempting regex extraction.", exc)
+            logger.warning("[SummarizationService] Direct JSON parse failed: %s. Attempting regex extraction and repair.", exc)
             match = re.search(r"\{.*\}", cleaned, re.DOTALL)
             if match:
                 try:
                     return json.loads(match.group(0))
                 except Exception:
                     pass
+
+            # Fallback: Extract overview, key_points, action_items manually via regex
+            recovered = {}
+            ov_match = re.search(r'"overview"\s*:\s*"([^"]+)', cleaned)
+            if ov_match:
+                recovered["overview"] = ov_match.group(1)
+
+            kp_matches = re.findall(r'"key_points"\s*:\s*\[(.*?)\]', cleaned, re.DOTALL)
+            if kp_matches:
+                kps = re.findall(r'"([^"]+)"', kp_matches[0])
+                recovered["key_points"] = kps
+
+            if recovered.get("overview"):
+                logger.info("[SummarizationService] Successfully recovered structured fields from partial JSON.")
+                return recovered
+
             raise SummarizationServiceError(f"Failed to parse valid JSON from Gemini response: {text[:200]}")
 
     def _build_summary_from_dict(
