@@ -37,6 +37,16 @@ def list_past_meetings() -> List[PastMeetingItem]:
     for job in meeting_dispatcher.get_all_jobs():
         event_ids.add(job.event_id)
 
+    # Also query ScheduledMeetingDB from Supabase PostgreSQL
+    try:
+        from app.db.database import SessionLocal
+        from app.db.models import ScheduledMeetingDB
+        with SessionLocal() as db:
+            for sm in db.query(ScheduledMeetingDB).all():
+                event_ids.add(sm.id)
+    except Exception:
+        pass
+
     items: List[PastMeetingItem] = []
     for eid in sorted(event_ids):
         job = meeting_dispatcher.get_job(eid)
@@ -44,10 +54,20 @@ def list_past_meetings() -> List[PastMeetingItem]:
         summary = storage_service.get_summary(eid)
         delivery = storage_service.get_delivery_record(eid)
 
-        subject = job.subject if job else f"Meeting {eid[:8]}"
-        start_dt = job.start_time if job else (transcript.created_at if transcript else (summary.created_at if summary else None))
+        db_sm = None
+        if not job:
+            try:
+                from app.db.database import SessionLocal
+                from app.db.repository import db_repository
+                with SessionLocal() as db:
+                    db_sm = db_repository.get_scheduled_meeting(db, eid)
+            except Exception:
+                pass
+
+        subject = job.subject if job else (f"Meeting {eid[:8]}" if not db_sm else f"Meeting {db_sm.id[:8]}")
+        start_dt = job.start_time if job else (db_sm.scheduled_time if db_sm else (transcript.created_at if transcript else (summary.created_at if summary else None)))
         end_dt = job.end_time if job else None
-        email = (job.organizer_email if job else None) or (delivery.recipient_email if delivery else None)
+        email = (job.organizer_email if job else None) or (db_sm.organizer_email if db_sm else None) or (delivery.recipient_email if delivery else None)
 
         item = PastMeetingItem(
             event_id=eid,
@@ -152,7 +172,17 @@ def get_past_meeting_summary(event_id: str) -> MeetingSummaryViewResponse:
     summary = storage_service.get_summary(event_id)
     delivery = storage_service.get_delivery_record(event_id)
 
-    if not job and not transcript and not summary and not delivery:
+    db_meeting = None
+    if not job:
+        try:
+            from app.db.database import SessionLocal
+            from app.db.repository import db_repository
+            with SessionLocal() as db:
+                db_meeting = db_repository.get_scheduled_meeting(db, event_id)
+        except Exception:
+            pass
+
+    if not job and not transcript and not summary and not delivery and not db_meeting:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"No meeting found with event_id '{event_id}'.",
@@ -165,6 +195,12 @@ def get_past_meeting_summary(event_id: str) -> MeetingSummaryViewResponse:
             start_time=job.start_time,
             end_time=job.end_time,
             organizer_email=job.organizer_email,
+        )
+    elif db_meeting:
+        meeting_info = MeetingInfo(
+            subject=f"Meeting {db_meeting.id[:8]}",
+            start_time=db_meeting.scheduled_time,
+            organizer_email=db_meeting.organizer_email,
         )
     else:
         email = delivery.recipient_email if delivery else None
