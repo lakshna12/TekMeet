@@ -73,6 +73,20 @@ async def join_meeting_endpoint(payload: dict = Body(...)):
         event_id = f"event_{uuid.uuid4().hex[:8]}"
 
     from app.services.graph_calling_service import graph_calling_service
+    from app.models.call import CallState, CallRecord
+
+    # Prevent duplicate join requests for already active/recording calls
+    for existing_job in meeting_dispatcher.get_jobs_by_status(MeetingStatus.TRIGGERED):
+        if existing_job.join_url and join_url and existing_job.join_url.strip() == join_url.strip():
+            logger.info("[CallsAPI] Meeting is already actively joined (call_id: %s). Skipping duplicate join.", existing_job.call_id)
+            return CallRecord(
+                call_id=existing_job.call_id,
+                event_id=existing_job.event_id,
+                status=CallState.ESTABLISHED,
+                scenario="app_hosted" if settings.use_app_hosted_media else "service_hosted",
+                is_active=True,
+            )
+
     record = await graph_calling_service.join_meeting(join_url, event_id)
 
     if record.call_id:

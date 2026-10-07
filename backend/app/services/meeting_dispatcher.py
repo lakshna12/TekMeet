@@ -205,6 +205,16 @@ class MeetingDispatcher:
             trigger_window_start = job.start_time - buffer_delta
 
             if job.status == MeetingStatus.SCHEDULED:
+                # Prevent duplicate dispatch if another job with same join_url is already TRIGGERED
+                already_active = any(
+                    other.status == MeetingStatus.TRIGGERED
+                    and (other.event_id == job.event_id or (other.join_url and job.join_url and other.join_url.strip() == job.join_url.strip()))
+                    for other in self._jobs.values()
+                    if other != job
+                )
+                if already_active:
+                    continue
+
                 if trigger_window_start <= current_time <= job.end_time:
                     # Due for join dispatch!
                     logger.info(
