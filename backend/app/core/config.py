@@ -265,7 +265,12 @@ class Settings(BaseSettings):
     def get_database_url(self) -> str:
         """Return database URL string, defaulting to local SQLite fallback if not explicitly configured."""
         if self.database_url and self.database_url.get_secret_value().strip():
-            return self.database_url.get_secret_value().strip()
+            raw_url = self.database_url.get_secret_value().strip()
+            if raw_url.startswith("postgresql://"):
+                return raw_url.replace("postgresql://", "postgresql+psycopg2://", 1)
+            elif raw_url.startswith("postgres://"):
+                return raw_url.replace("postgres://", "postgresql+psycopg2://", 1)
+            return raw_url
         return "sqlite:///./backend/app/data/tekmeet.db"
 
 
