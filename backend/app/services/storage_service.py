@@ -125,6 +125,22 @@ class StorageService:
                         item = v
                         break
             if not item:
+                # Fallback to Database (Supabase PostgreSQL)
+                try:
+                    with SessionLocal() as db:
+                        db_rec = db_repository.get_recording(db, event_id_or_transcript_id)
+                        if not db_rec:
+                            db_rec = db.query(MeetingRecordingDB).filter(MeetingRecordingDB.id == event_id_or_transcript_id).first()
+                        if db_rec:
+                            return Transcript(
+                                transcript_id=db_rec.id,
+                                event_id=db_rec.meeting_id,
+                                recording_file=db_rec.audio_storage_path,
+                                full_text=db_rec.transcript_text or "",
+                                duration_seconds=db_rec.duration_seconds,
+                            )
+                except Exception as exc:
+                    logger.debug("[StorageService] DB lookup for transcript failed: %s", exc)
                 return None
             try:
                 return Transcript.model_validate(item)
@@ -168,6 +184,29 @@ class StorageService:
                             seen_ids.add(t_id)
                         except Exception:
                             pass
+
+            # Merge from Database (Supabase PostgreSQL)
+            try:
+                with SessionLocal() as db:
+                    all_recs = db.query(MeetingRecordingDB).all()
+                    for rec in all_recs:
+                        if rec.id not in seen_ids:
+                            try:
+                                result.append(
+                                    Transcript(
+                                        transcript_id=rec.id,
+                                        event_id=rec.meeting_id,
+                                        recording_file=rec.audio_storage_path,
+                                        full_text=rec.transcript_text or "",
+                                        duration_seconds=rec.duration_seconds,
+                                    )
+                                )
+                                seen_ids.add(rec.id)
+                            except Exception:
+                                pass
+            except Exception as exc:
+                logger.debug("[StorageService] DB lookup for all transcripts failed: %s", exc)
+
             return result
 
     # --- Meeting Summary Persistence ---
@@ -204,6 +243,17 @@ class StorageService:
                         item = v
                         break
             if not item:
+                # Fallback to Database (Supabase PostgreSQL)
+                try:
+                    with SessionLocal() as db:
+                        db_sum = db_repository.get_summary(db, event_id_or_summary_id)
+                        if not db_sum:
+                            db_sum = db.query(MeetingSummaryDB).filter(MeetingSummaryDB.id == event_id_or_summary_id).first()
+                        if db_sum and db_sum.summary_text_json:
+                            raw = json.loads(db_sum.summary_text_json) if isinstance(db_sum.summary_text_json, str) else db_sum.summary_text_json
+                            return MeetingSummary.model_validate(raw)
+                except Exception as exc:
+                    logger.debug("[StorageService] DB lookup for summary failed: %s", exc)
                 return None
             try:
                 return MeetingSummary.model_validate(item)
@@ -238,6 +288,22 @@ class StorageService:
                             seen_ids.add(s_id)
                         except Exception:
                             pass
+
+            # Merge from Database (Supabase PostgreSQL)
+            try:
+                with SessionLocal() as db:
+                    all_sums = db.query(MeetingSummaryDB).all()
+                    for s in all_sums:
+                        if s.id not in seen_ids and s.summary_text_json:
+                            try:
+                                raw = json.loads(s.summary_text_json) if isinstance(s.summary_text_json, str) else s.summary_text_json
+                                result.append(MeetingSummary.model_validate(raw))
+                                seen_ids.add(s.id)
+                            except Exception:
+                                pass
+            except Exception as exc:
+                logger.debug("[StorageService] DB lookup for all summaries failed: %s", exc)
+
             return result
 
     # --- Delivery Record Persistence ---
