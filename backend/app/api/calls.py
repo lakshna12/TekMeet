@@ -76,14 +76,17 @@ async def join_meeting_endpoint(payload: dict = Body(...)):
     record = await graph_calling_service.join_meeting(join_url, event_id)
 
     if record.call_id:
+        from datetime import timedelta
+        now_utc = datetime.now(timezone.utc)
         job = ScheduledMeetingJob(
             event_id=event_id,
-            subject="Teams Meeting",
-            start_time=datetime.now(timezone.utc),
-            end_time=datetime.now(timezone.utc),
+            subject=payload.get("subject") or "Teams Meeting",
+            start_time=now_utc,
+            end_time=now_utc + timedelta(hours=2),
             call_id=record.call_id,
             join_url=join_url,
             status=MeetingStatus.TRIGGERED,
+            dispatched_at=now_utc,
         )
         meeting_dispatcher._jobs[event_id] = job
 
