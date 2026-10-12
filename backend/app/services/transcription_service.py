@@ -189,13 +189,13 @@ class TranscriptionService:
         # Step 5: Send file to Deepgram REST API
         try:
             model_name = self.settings.deepgram_model
-            url = f"https://api.deepgram.com/v1/listen?punctuate=true&utterances=true&smart_format=true&model={model_name}"
+            url = f"https://api.deepgram.com/v1/listen?punctuate=true&utterances=true&smart_format=true&detect_language=true&model={model_name}"
             headers = {
                 "Authorization": f"Token {api_key}",
                 "Content-Type": self._get_media_type(file_name),
             }
 
-            async with httpx.AsyncClient(timeout=45.0) as client:
+            async with httpx.AsyncClient(timeout=90.0) as client:
                 response = await client.post(url, headers=headers, content=audio_bytes)
 
             if response.status_code != 200:
@@ -219,6 +219,28 @@ class TranscriptionService:
                 file_name=file_name,
                 data=res_data,
             )
+
+            # Fallback for Indian English / Hindi / Hinglish if primary transcription returned empty
+            if tr.status == TranscriptionStatus.EMPTY or not tr.full_text or tr.full_text.strip() == "No speech detected.":
+                logger.info("[DEEPGRAM] Primary transcription returned empty. Retrying with Hindi/Hinglish (language=hi)...")
+                try:
+                    url_hi = "https://api.deepgram.com/v1/listen?punctuate=true&utterances=true&smart_format=true&language=hi"
+                    async with httpx.AsyncClient(timeout=60.0) as client:
+                        resp_hi = await client.post(url_hi, headers=headers, content=audio_bytes)
+                    if resp_hi.status_code == 200:
+                        tr_hi = self._parse_deepgram_response(
+                            transcript_id=transcript_id,
+                            event_id=event_id,
+                            call_id=call_id,
+                            file_name=file_name,
+                            data=resp_hi.json(),
+                        )
+                        if tr_hi.status != TranscriptionStatus.EMPTY and tr_hi.full_text and tr_hi.full_text.strip() != "No speech detected.":
+                            logger.info("[DEEPGRAM] Hindi fallback successful! Captured %d chars: '%s'", len(tr_hi.full_text), tr_hi.full_text[:100])
+                            tr = tr_hi
+                except Exception as ex_hi:
+                    logger.warning("[DEEPGRAM] Hindi fallback error: %s", ex_hi)
+
             logger.info(
                 "[DEEPGRAM] Transcription completed\n"
                 "[DEEPGRAM] Transcript length: %d chars\n"
@@ -290,6 +312,12 @@ class TranscriptionService:
                 )
 
         full_text_trimmed = full_text.strip()
+        tokens = full_text_trimmed.split()
+        if tokens and len(tokens) >= 3 and len(set(tokens)) == 1 and len(tokens[0]) <= 2:
+            logger.info("[TranscriptionService] Filtered repetitive STT syllable hallucination: '%s'", full_text_trimmed)
+            full_text_trimmed = ""
+            segments = []
+
         status_enum = TranscriptionStatus.COMPLETED if full_text_trimmed else TranscriptionStatus.EMPTY
         if not full_text_trimmed:
             full_text_trimmed = "No speech detected."

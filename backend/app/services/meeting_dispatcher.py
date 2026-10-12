@@ -129,13 +129,8 @@ class MeetingDispatcher:
             start_dt = m.start_time or current_time
             end_dt = m.end_time or (start_dt + timedelta(hours=1))
 
-            # Check by event_id or by matching join_url
+            # Check strictly by event_id
             existing_job = self._jobs.get(m.event_id)
-            if not existing_job and m.join_url:
-                for j in self._jobs.values():
-                    if j.join_url and j.join_url.strip() == m.join_url.strip():
-                        existing_job = j
-                        break
 
             if existing_job:
                 # Update details if subject or URL changed
@@ -145,9 +140,14 @@ class MeetingDispatcher:
                 existing_job.end_time = end_dt
                 existing_job.updated_at = current_time
 
-                if m.is_cancelled and existing_job.status == MeetingStatus.SCHEDULED:
-                    existing_job.status = MeetingStatus.CANCELLED
-                    existing_job.dispatch_message = "Cancelled on calendar"
+                if m.is_cancelled:
+                    if existing_job.status == MeetingStatus.SCHEDULED:
+                        existing_job.status = MeetingStatus.CANCELLED
+                        existing_job.dispatch_message = "Cancelled on calendar"
+                elif existing_job.status in (MeetingStatus.MISSED, MeetingStatus.CANCELLED) and current_time <= end_dt:
+                    # Rescheduled / uncancelled meeting that is now active or upcoming
+                    existing_job.status = MeetingStatus.SCHEDULED
+                    existing_job.dispatch_message = "Scheduled and waiting for join window"
 
                 updated_jobs.append(existing_job)
             else:
@@ -205,16 +205,6 @@ class MeetingDispatcher:
             trigger_window_start = job.start_time - buffer_delta
 
             if job.status == MeetingStatus.SCHEDULED:
-                # Prevent duplicate dispatch if another job with same join_url is already TRIGGERED
-                already_active = any(
-                    other.status == MeetingStatus.TRIGGERED
-                    and (other.event_id == job.event_id or (other.join_url and job.join_url and other.join_url.strip() == job.join_url.strip()))
-                    for other in self._jobs.values()
-                    if other != job
-                )
-                if already_active:
-                    continue
-
                 if trigger_window_start <= current_time <= job.end_time:
                     # Due for join dispatch!
                     logger.info(
@@ -251,10 +241,14 @@ class MeetingDispatcher:
 
             elif job.status == MeetingStatus.TRIGGERED:
                 # Active call state verification via Graph API polling & webhook fallback.
-                # If participants manually end/leave the Teams call, Graph GET /communications/calls/{call_id}
-                # returns state 'terminated' / 'terminating' or HTTP 404 (deleted call resource).
+                # Important: Active calls must continue recording until:
+                # 1. Graph explicitly returned CallState.TERMINATED, OR
+                # 2. Hard absolute safety cutoff (dispatched_at + 4 hours) has elapsed, OR
+                # 3. Webhook callback arrives (/callback or /recording-stopped).
                 is_terminated = False
-                if job.call_id:
+                start_ref = job.dispatched_at or job.start_time
+                call_elapsed = (current_time - start_ref).total_seconds()
+                if job.call_id and call_elapsed >= 90:
                     try:
                         from app.services.graph_calling_service import graph_calling_service
                         from app.models.call import CallState
@@ -262,18 +256,20 @@ class MeetingDispatcher:
                         if cs == CallState.TERMINATED:
                             is_terminated = True
                             logger.info(
-                                "[GRAPH] Active call state check detected call termination for job '%s' (event_id: %s, call_id: %s)",
+                                "[GRAPH] Active call state check detected call termination for job '%s' (event_id: %s, call_id: %s, elapsed: %.1fs)",
                                 job.subject,
                                 job.event_id,
                                 job.call_id,
+                                call_elapsed,
                             )
                     except Exception as exc:
                         logger.debug("Error checking call state for job %s: %s", job.event_id, exc)
 
-                safety_cutoff = job.end_time + timedelta(hours=2)
-                should_end = is_terminated or (not job.call_id and current_time > job.end_time) or (current_time > safety_cutoff)
+                start_ref = job.dispatched_at or job.start_time
+                hard_safety_cutoff = start_ref + timedelta(hours=4)
+                should_end = is_terminated or (not job.call_id and current_time > job.end_time) or (current_time > hard_safety_cutoff)
                 if should_end:
-                    logger.info("[DISPATCHER] termination_reason=GRAPH_CALL_ENDED" if is_terminated else "[DISPATCHER] termination_reason=SCHEDULED_OR_SAFETY_END")
+                    logger.info("[DISPATCHER] termination_reason=GRAPH_CALL_ENDED" if is_terminated else "[DISPATCHER] termination_reason=HARD_SAFETY_OR_MOCK_END")
                     logger.info("[DISPATCHER] safety_cutoff_check=SKIPPED" if is_terminated else "[DISPATCHER] safety_cutoff_check=TRIGGERED")
                     completed_job = self.handle_actual_meeting_end(job, call_id=job.call_id, actual_end_time=current_time)
                     if completed_job:
@@ -283,21 +279,6 @@ class MeetingDispatcher:
                             task.add_done_callback(self._pipeline_tasks.discard)
                         except Exception as exc:
                             logger.warning("Could not spawn Phase 5 pipeline background task for %s: %s", job.event_id, exc)
-                elif current_time > safety_cutoff:
-                    logger.warning(
-                        "[MeetingDispatcher] Safety cutoff fallback reached for meeting '%s' (%s) — 2 hours past scheduled end. Finalizing call.",
-                        job.subject,
-                        job.event_id,
-                    )
-                    logger.info("[DISPATCHER] safety_cutoff_check=TRIGGERED")
-                    completed_job = self.handle_actual_meeting_end(job, call_id=job.call_id, actual_end_time=current_time)
-                    if completed_job:
-                        try:
-                            task = asyncio.create_task(self.trigger_phase5_pipeline(completed_job))
-                            self._pipeline_tasks.add(task)
-                            task.add_done_callback(self._pipeline_tasks.discard)
-                        except Exception as exc:
-                            logger.warning("Could not spawn Phase 5 pipeline background task for safety fallback on %s: %s", job.event_id, exc)
 
         return dispatched_jobs
 
@@ -326,7 +307,7 @@ class MeetingDispatcher:
         # Duplicate termination event protection
         if job.status == MeetingStatus.COMPLETED:
             logger.info("[MeetingDispatcher] Meeting '%s' (event_id: %s) is ALREADY completed. Duplicate termination ignored.", job.subject, job.event_id)
-            return job
+            return None
 
         end_dt = actual_end_time or datetime.now(timezone.utc)
         if end_dt.tzinfo is None:
@@ -409,7 +390,7 @@ class MeetingDispatcher:
                 try:
                     async with httpx.AsyncClient(timeout=5.0) as client:
                         resp = await client.get(download_url)
-                        if resp.status_code == 200 and len(resp.content) > 0:
+                        if resp.status_code == 200 and len(resp.content) > 1000:
                             logger.info(
                                 "[MeetingDispatcher] Recording file '%s' is ready on MediaWorker (%d bytes, HTTP 200, attempt %d/%d).",
                                 filename,
@@ -418,6 +399,8 @@ class MeetingDispatcher:
                                 max_attempts,
                             )
                             return True
+                        elif resp.status_code == 200:
+                            logger.debug("[MeetingDispatcher] Recording file '%s' returned HTTP 200 but only %d bytes (stub). Retrying...", filename, len(resp.content))
                 except Exception as exc:
                     logger.debug("[MeetingDispatcher] MediaWorker readiness check attempt %d/%d failed: %s", attempt, max_attempts, exc)
 
@@ -463,35 +446,44 @@ class MeetingDispatcher:
                     stop_url = f"{self.settings.media_worker_url}/api/media/recording/stop"
                     if job.call_id:
                         stop_url += f"?callId={job.call_id}"
-                    async with httpx.AsyncClient(timeout=5.0) as client:
+                    reported_size = 0
+                    async with httpx.AsyncClient(timeout=10.0) as client:
                         resp = await client.get(stop_url)
                         if resp.status_code == 200:
                             try:
                                 data = resp.json()
                                 fp = data.get("filePath") or data.get("fileName") or data.get("filename")
+                                reported_size = data.get("fileSize", 0)
                                 if fp:
                                     final_rec_path = Path(fp).name
                             except Exception:
                                 pass
-                        if final_rec_path == f"meeting_{job.event_id}.wav" or not Path(final_rec_path).exists():
+
+                        # If stop returned an empty stub (<= 1000 bytes) or placeholder, find actual recording from list
+                        if final_rec_path == f"meeting_{job.event_id}.wav" or reported_size <= 1000:
                             try:
                                 list_resp = await client.get(f"{self.settings.media_worker_url}/api/media/recordings/list")
                                 if list_resp.status_code == 200:
                                     files = list_resp.json()
-                                    safe_eid = re.sub(r'[^a-zA-Z0-9_-]', '_', job.event_id)[:20] if job.event_id else ""
+                                    import re
                                     safe_cid = re.sub(r'[^a-zA-Z0-9_-]', '_', job.call_id)[:12] if job.call_id else ""
+
+                                    # Find non-empty WAV files strictly matching this call
                                     candidate_files = []
-                                    for f in files:
-                                        fname = f.get("name", "")
-                                        if fname.endswith(".wav") and f.get("sizeBytes", 0) > 100:
-                                            if (safe_cid and safe_cid in fname) or (safe_eid and safe_eid in fname):
-                                                candidate_files.append(f)
+                                    if safe_cid:
+                                        candidate_files = [
+                                            f for f in files
+                                            if f.get("name", "").endswith(".wav") and f.get("sizeBytes", 0) > 1000
+                                            and safe_cid in f.get("name", "")
+                                        ]
                                     if candidate_files:
-                                        # Always pick the largest recorded audio session for this meeting
-                                        largest_file = max(candidate_files, key=lambda x: x.get("sizeBytes", 0))
-                                        final_rec_path = largest_file.get("name", "")
-                            except Exception:
-                                pass
+                                        best_file = max(candidate_files, key=lambda x: x.get("sizeBytes", 0))
+                                        final_rec_path = best_file.get("name", "")
+                                        logger.info("[DISPATCHER] Selected best recording '%s' (%d bytes) strictly for call %s", final_rec_path, best_file.get("sizeBytes", 0), safe_cid)
+                                    else:
+                                        logger.warning("[DISPATCHER] No recording on Media Worker matched call %s (found %d files)", safe_cid, len(files))
+                            except Exception as ex_list:
+                                logger.warning("[DISPATCHER] Failed to query media recordings list: %s", ex_list)
 
                         logger.info(
                             "[DISPATCHER] Recording stop response received (status %d)\n"

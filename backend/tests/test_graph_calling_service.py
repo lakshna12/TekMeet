@@ -281,8 +281,22 @@ async def test_get_call_state_connected(mock_settings, mock_auth):
 
 
 @pytest.mark.asyncio
+async def test_get_call_state_explicit_terminated(mock_settings, mock_auth):
+    """Test get_call_state returns TERMINATED when Graph API explicitly reports state 'terminated'."""
+    service = GraphCallingService(auth_service=mock_auth, app_settings=mock_settings)
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {"id": "call-123", "state": "terminated"}
+
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock, return_value=mock_resp):
+        state = await service.get_call_state("call-123")
+
+    assert state == CallState.TERMINATED
+
+
+@pytest.mark.asyncio
 async def test_get_call_state_terminated_when_404(mock_settings, mock_auth):
-    """Test get_call_state returns TERMINATED when Graph API returns 404 Not Found."""
+    """Test get_call_state returns TERMINATED when Graph API returns 404 indicating call ended."""
     service = GraphCallingService(auth_service=mock_auth, app_settings=mock_settings)
     mock_resp = MagicMock()
     mock_resp.status_code = 404

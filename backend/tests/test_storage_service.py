@@ -159,25 +159,27 @@ def test_5_missing_registry_files_created(temp_storage_dir: Path):
 
 def test_6_corrupted_json_handled_safely(temp_storage_dir: Path):
     """Test 6: Corrupted JSON file is handled safely without crashing."""
-    storage = StorageService(data_dir=temp_storage_dir)
+    from unittest.mock import patch
+    with patch("app.services.storage_service.SessionLocal", side_effect=Exception("DB disabled for disk unit test")):
+        storage = StorageService(data_dir=temp_storage_dir)
 
-    # Intentionally corrupt the transcript_registry.json file
-    storage.save_transcript(
-        Transcript(
-            transcript_id="tr_606",
-            event_id="event_606",
-            recording_file="test.wav",
-            status=TranscriptionStatus.COMPLETED,
+        # Intentionally corrupt the transcript_registry.json file
+        storage.save_transcript(
+            Transcript(
+                transcript_id="tr_606",
+                event_id="event_606",
+                recording_file="test.wav",
+                status=TranscriptionStatus.COMPLETED,
+            )
         )
-    )
-    assert storage.transcript_file.exists()
+        assert storage.transcript_file.exists()
 
-    with open(storage.transcript_file, "w", encoding="utf-8") as f:
-        f.write("{ INVALID MALFORMED JSON content... ")
+        with open(storage.transcript_file, "w", encoding="utf-8") as f:
+            f.write("{ INVALID MALFORMED JSON content... ")
 
-    # Querying corrupted file should return None, not raise exception
-    res = storage.get_transcript("event_606")
-    assert res is None
+        # Querying corrupted file should return None, not raise exception
+        res = storage.get_transcript("event_606")
+        assert res is None
 
     # Saving new record should safely overwrite corrupted file
     saved_ok = storage.save_transcript(

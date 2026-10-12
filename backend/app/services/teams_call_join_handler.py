@@ -28,6 +28,7 @@ class TeamsCallJoinHandler:
 
     def __init__(self, calling_service: Optional[GraphCallingService] = None):
         self.calling_service = calling_service or graph_calling_service
+        self._joining_in_progress: set = set()
 
     async def handle_join(self, job: ScheduledMeetingJob) -> bool:
         """Join a Teams meeting using Graph Cloud Communications API.
@@ -47,14 +48,22 @@ class TeamsCallJoinHandler:
             )
             return False
 
-        if job.call_id or job.status == MeetingStatus.TRIGGERED:
+        if job.call_id or job.status == MeetingStatus.COMPLETED or job.event_id in self._joining_in_progress:
             logger.info(
-                "[Duplicate Join Ignored] Meeting '%s' (event_id: %s) is already joined/triggered (call_id: %s).",
+                "[Duplicate Join Ignored] Meeting '%s' (event_id: %s) is already joined/in-progress (call_id: %s).",
                 job.subject,
                 job.event_id,
                 job.call_id,
             )
             return True
+
+        self._joining_in_progress.add(job.event_id)
+        try:
+            return await self._execute_join(job)
+        finally:
+            self._joining_in_progress.discard(job.event_id)
+
+    async def _execute_join(self, job: ScheduledMeetingJob) -> bool:
 
         logger.info(
             "[DISPATCHER] Starting meeting join\n"
@@ -105,7 +114,8 @@ class TeamsCallJoinHandler:
                 )
                 try:
                     async with httpx.AsyncClient(timeout=5.0) as client:
-                        rec_url = f"{settings.media_worker_url}/api/media/recording/start?eventId={job.event_id}&callId={record.call_id}"
+                        pub_url = settings.public_backend_url or (settings.bot_callback_url.replace('/api/v1/calls/callback', '') if settings.bot_callback_url else "")
+                        rec_url = f"{settings.media_worker_url}/api/media/recording/start?eventId={job.event_id}&callId={record.call_id}&backendUrl={pub_url}"
                         resp = await client.get(rec_url)
                         if resp.status_code == 200:
                             logger.info(

@@ -73,20 +73,6 @@ async def join_meeting_endpoint(payload: dict = Body(...)):
         event_id = f"event_{uuid.uuid4().hex[:8]}"
 
     from app.services.graph_calling_service import graph_calling_service
-    from app.models.call import CallState, CallRecord
-
-    # Prevent duplicate join requests for already active/recording calls
-    for existing_job in meeting_dispatcher.get_jobs_by_status(MeetingStatus.TRIGGERED):
-        if existing_job.join_url and join_url and existing_job.join_url.strip() == join_url.strip():
-            logger.info("[CallsAPI] Meeting is already actively joined (call_id: %s). Skipping duplicate join.", existing_job.call_id)
-            return CallRecord(
-                call_id=existing_job.call_id,
-                event_id=existing_job.event_id,
-                status=CallState.ESTABLISHED,
-                scenario="app_hosted" if settings.use_app_hosted_media else "service_hosted",
-                is_active=True,
-            )
-
     record = await graph_calling_service.join_meeting(join_url, event_id)
 
     if record.call_id:
@@ -99,6 +85,8 @@ async def join_meeting_endpoint(payload: dict = Body(...)):
             call_id=record.call_id,
             join_url=join_url,
             status=MeetingStatus.TRIGGERED,
+            created_at=now,
+            updated_at=now,
         )
         meeting_dispatcher._jobs[event_id] = job
 
@@ -127,13 +115,24 @@ async def handle_graph_call_notification(notification: dict = Body(...)):
     triggered_events = []
 
     for item in values:
-        resource_data = item.get("resourceData", {}) if isinstance(item, dict) else {}
+        if not isinstance(item, dict):
+            continue
+
+        resource_data_raw = item.get("resourceData")
+        resource_data = resource_data_raw if isinstance(resource_data_raw, dict) else {}
+
         call_id = resource_data.get("id") or item.get("id")
+        # If call_id not found directly in resourceData dict, try extracting from resource URL
+        if not call_id and item.get("resource"):
+            resource_url = str(item.get("resource"))
+            if "/calls/" in resource_url:
+                call_id = resource_url.split("/calls/")[1].split("/")[0]
+
         call_state = (resource_data.get("state") or item.get("state") or "").lower()
         change_type = (item.get("changeType") or "").lower()
         result_info = resource_data.get("resultInfo") or item.get("resultInfo")
 
-        if result_info:
+        if result_info and isinstance(result_info, dict):
             logger.info(
                 "[GRAPH Webhook] ResultInfo for call %s | Code: %s | Subcode: %s | Message: %s",
                 call_id or "N/A",
@@ -162,17 +161,27 @@ async def handle_graph_call_notification(notification: dict = Body(...)):
                 active_jobs = meeting_dispatcher.get_jobs_by_status(MeetingStatus.TRIGGERED)
                 if active_jobs:
                     job = active_jobs[0]
+            if not job and call_id:
+                # Check if this call was already completed
+                for completed in meeting_dispatcher.get_jobs_by_status(MeetingStatus.COMPLETED):
+                    if completed.call_id == call_id:
+                        logger.info("[CallsAPI Webhook] Call %s was already completed. Skipping duplicate.", call_id)
+                        job = completed
+                        break
             if not job:
                 # Fallback job creation so pipeline is never lost
                 import uuid
+                now = datetime.now(timezone.utc)
                 fallback_event_id = f"event_{uuid.uuid4().hex[:8]}"
                 job = ScheduledMeetingJob(
                     event_id=fallback_event_id,
                     subject="Teams Meeting",
-                    start_time=datetime.now(timezone.utc),
-                    end_time=datetime.now(timezone.utc),
+                    start_time=now,
+                    end_time=now,
                     call_id=call_id,
                     status=MeetingStatus.TRIGGERED,
+                    created_at=now,
+                    updated_at=now,
                 )
                 meeting_dispatcher._jobs[job.event_id] = job
 
@@ -210,15 +219,24 @@ async def handle_recording_stopped_callback(payload: dict = Body(...)):
         if active_jobs:
             job = active_jobs[0]
     if not job:
+        for completed in meeting_dispatcher.get_jobs_by_status(MeetingStatus.COMPLETED):
+            if (call_id and completed.call_id == call_id) or (event_id and completed.event_id == event_id):
+                logger.info("[CallsAPI Webhook] Recording-stopped received for already completed job '%s'. Skipping duplicate.", completed.event_id)
+                job = completed
+                break
+    if not job:
         import uuid
+        now = datetime.now(timezone.utc)
         fallback_event_id = event_id or f"event_{uuid.uuid4().hex[:8]}"
         job = ScheduledMeetingJob(
             event_id=fallback_event_id,
             subject="Teams Meeting",
-            start_time=datetime.now(timezone.utc),
-            end_time=datetime.now(timezone.utc),
+            start_time=now,
+            end_time=now,
             call_id=call_id,
             status=MeetingStatus.TRIGGERED,
+            created_at=now,
+            updated_at=now,
         )
         meeting_dispatcher._jobs[job.event_id] = job
 

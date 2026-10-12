@@ -321,10 +321,12 @@ class GraphCallingService:
     async def get_call_state(self, call_id: str) -> CallState:
         """Query Graph GET /communications/calls/{call_id} to get real-time call state.
 
-        Returns CallState.TERMINATED if the call is in 'terminated'/'terminating' state or if Graph returns HTTP 404 (deleted).
+        Returns CallState.TERMINATED if the call is explicitly in 'terminated'/'terminating' state.
+        Returns CallState.ESTABLISHED / ESTABLISHING for active states.
+        Transient errors or 404s keep the call active to prevent premature pipeline triggering.
         """
         if not call_id:
-            return CallState.TERMINATED
+            return CallState.ESTABLISHED
 
         endpoint = f"{self.settings.microsoft_graph_base_url}/communications/calls/{call_id}"
         try:
@@ -335,7 +337,7 @@ class GraphCallingService:
                     data = resp.json()
                     state_str = (data.get("state") or "").lower()
                     result_info = data.get("resultInfo")
-                    
+
                     if result_info:
                         logger.info(
                             "[GRAPH] Call %s state details | State: %s | ResultCode: %s | Subcode: %s | Message: %s",
@@ -350,19 +352,16 @@ class GraphCallingService:
                         logger.info("[GRAPH] Call state transition | Call ID: %s | State: TERMINATED (from '%s')", call_id, state_str)
                         return CallState.TERMINATED
                     elif state_str == "established":
-                        logger.info("[GRAPH] Call state transition | Call ID: %s | State: ESTABLISHED", call_id)
                         return CallState.ESTABLISHED
                     elif state_str == "establishing":
-                        logger.info("[GRAPH] Call state transition | Call ID: %s | State: ESTABLISHING (waiting for media handshake / callback)", call_id)
                         return CallState.ESTABLISHING
                     else:
-                        logger.info("[GRAPH] Call state transition | Call ID: %s | State: %s", call_id, state_str.upper())
                         return CallState.ESTABLISHED
                 elif resp.status_code in (404, 410):
-                    logger.info("[GRAPH] Call state transition | Call ID: %s | State: TERMINATED (HTTP %d resource deleted/ended)", call_id, resp.status_code)
+                    logger.info("[GRAPH] GET /communications/calls/%s returned HTTP %d — call terminated/deleted in Graph", call_id, resp.status_code)
                     return CallState.TERMINATED
                 else:
-                    logger.debug("[GraphCallingService] GET /communications/calls/%s returned HTTP %d: %s", call_id, resp.status_code, resp.text[:150])
+                    logger.debug("[GraphCallingService] GET /communications/calls/%s returned HTTP %d", call_id, resp.status_code)
                     return CallState.ESTABLISHED
         except Exception as exc:
             logger.debug("[GraphCallingService] Exception querying call state for %s: %s", call_id, exc)

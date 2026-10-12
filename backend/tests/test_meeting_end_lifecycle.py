@@ -200,7 +200,8 @@ async def test_duplicate_termination_events_ignored(mock_settings, caplog):
 
     # Second (duplicate) termination event
     res2 = dispatcher.handle_actual_meeting_end(job, call_id="call_dup_555")
-    assert res2.status == MeetingStatus.COMPLETED
+    assert res2 is None
+    assert job.status == MeetingStatus.COMPLETED
     assert "Duplicate termination ignored" in caplog.text
 
 

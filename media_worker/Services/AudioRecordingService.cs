@@ -194,9 +194,18 @@ namespace MediaWorker.Services
                     bool isSameCall = !string.IsNullOrEmpty(callId) && string.Equals(_currentCallId, callId, StringComparison.OrdinalIgnoreCase);
                     bool isSameEvent = !string.IsNullOrEmpty(eventId) && string.Equals(_currentEventId, eventId, StringComparison.OrdinalIgnoreCase);
 
-                    if (isSameCall || (string.IsNullOrEmpty(callId) && isSameEvent))
+                    if (isSameCall || isSameEvent)
                     {
-                        _logger.LogInformation("[Duplicate Start Ignored] eventId={EventId} | Graph callId={CallId}. Active recording session is already running for the SAME call at {Path}", eventId, callId, _currentFilePath);
+                        _logger.LogInformation("[Duplicate Start Ignored] eventId={EventId} | Graph callId={CallId}. Active recording session is already running for this meeting at {Path}", eventId, callId, _currentFilePath);
+                        return _currentFilePath ?? string.Empty;
+                    }
+
+                    // Protect an ongoing recording that is actively capturing sound data
+                    var elapsed = _recordingStartTime.HasValue ? DateTime.UtcNow - _recordingStartTime.Value : TimeSpan.Zero;
+                    if (_pcmDataBytesWritten > 0 && elapsed.TotalMinutes < 15.0)
+                    {
+                        _logger.LogWarning("[Recording Start Ignored] Active recording session (current eventId={CurEventId}, callId={CurCallId}) is currently active and writing audio ({Bytes} bytes written, {Dur:F1}s elapsed). Ignoring new start request for eventId={NewEventId}, callId={NewCallId}.",
+                            _currentEventId, _currentCallId, _pcmDataBytesWritten, elapsed.TotalSeconds, eventId, callId);
                         return _currentFilePath ?? string.Empty;
                     }
 

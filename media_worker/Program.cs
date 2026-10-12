@@ -199,6 +199,37 @@ namespace MediaWorker
                     logger.LogInformation("[MEDIA] FINAL WAV EXISTS = {Exists}", File.Exists(filePath));
                     logger.LogInformation("[MEDIA] FINAL WAV SIZE = {Size}", fileSize);
 
+                    // If final file is an empty stub (<= 1000 bytes), fallback to largest non-empty recording in directory
+                    if (fileSize <= 1000 && !string.IsNullOrEmpty(recDir) && Directory.Exists(recDir))
+                    {
+                        try
+                        {
+                            var wavFiles = Directory.GetFiles(recDir, "*.wav");
+                            long largestSize = fileSize;
+                            string bestPath = filePath;
+                            foreach (var wf in wavFiles)
+                            {
+                                var fi = new FileInfo(wf);
+                                if (fi.Length > largestSize)
+                                {
+                                    largestSize = fi.Length;
+                                    bestPath = wf;
+                                }
+                            }
+                            if (largestSize > fileSize)
+                            {
+                                filePath = bestPath;
+                                fileName = Path.GetFileName(filePath);
+                                fileSize = largestSize;
+                                logger.LogInformation("[MEDIA] Empty stub overridden. Selected largest available recording: {Path} ({Size} bytes)", filePath, fileSize);
+                            }
+                        }
+                        catch (Exception exFallback)
+                        {
+                            logger.LogWarning(exFallback, "[MEDIA] Error finding largest recording fallback");
+                        }
+                    }
+
                     if (fileSize == 0 || string.IsNullOrEmpty(fileName))
                     {
                         resp.StatusCode = 500;

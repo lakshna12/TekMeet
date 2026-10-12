@@ -25,7 +25,7 @@ class ScheduledMeetingDB(Base):
 
     __tablename__ = "scheduled_meetings"
 
-    id = Column(String(100), primary_key=True, index=True, comment="Meeting event ID or unique identifier")
+    id = Column(String(300), primary_key=True, index=True, comment="Meeting event ID or unique identifier")
     meeting_link_or_id = Column(String(500), nullable=False, comment="Teams meeting join link or meeting ID")
     scheduled_time = Column(DateTime(timezone=True), nullable=False, index=True, comment="Scheduled start time")
     organizer_email = Column(String(255), nullable=False, index=True, comment="Organizer email address")
@@ -46,8 +46,8 @@ class MeetingRecordingDB(Base):
 
     __tablename__ = "meeting_recordings"
 
-    id = Column(String(100), primary_key=True, index=True, comment="Recording ID or transcript ID")
-    meeting_id = Column(String(100), ForeignKey("scheduled_meetings.id", ondelete="CASCADE"), nullable=False, index=True, comment="Associated meeting ID")
+    id = Column(String(300), primary_key=True, index=True, comment="Recording ID or transcript ID")
+    meeting_id = Column(String(300), ForeignKey("scheduled_meetings.id", ondelete="CASCADE"), nullable=False, index=True, comment="Associated meeting ID")
     audio_storage_path = Column(String(500), nullable=False, comment="File path to saved MP4/WAV audio recording")
     transcript_text = Column(Text, nullable=True, comment="Full STT transcript text")
     duration_seconds = Column(Float, nullable=True, comment="Recording duration in seconds")
@@ -62,8 +62,8 @@ class MeetingSummaryDB(Base):
 
     __tablename__ = "meeting_summaries"
 
-    id = Column(String(100), primary_key=True, index=True, comment="Summary ID")
-    meeting_id = Column(String(100), ForeignKey("scheduled_meetings.id", ondelete="CASCADE"), nullable=False, index=True, comment="Associated meeting ID")
+    id = Column(String(300), primary_key=True, index=True, comment="Summary ID")
+    meeting_id = Column(String(300), ForeignKey("scheduled_meetings.id", ondelete="CASCADE"), nullable=False, index=True, comment="Associated meeting ID")
     summary_text_json = Column(Text, nullable=False, comment="JSON string containing structured overview, key points, action items, decisions")
     delivered_at = Column(DateTime(timezone=True), nullable=True, index=True, comment="Timestamp when summary email was successfully delivered")
     created_at = Column(DateTime(timezone=True), nullable=False, default=utc_now, comment="Record creation timestamp")
